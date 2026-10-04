@@ -2596,7 +2596,7 @@ def rerank_maxsim_signals(model, store, ex, temps):
 
 @app.function(hide_code=True)
 @torch.no_grad()
-def query_likelihood_scores(model, tokenizer, query, docs, batch_tokens=40000):
+def query_likelihood_scores(model, tokenizer, query, docs, batch_tokens=16000, row_chunk=8):
     """UPR-style relevance: mean log p(query token | document, instruction) over the query tokens, one short
     sequence per document, batched with right padding (causal, so real rows never see the padding).
 
@@ -2627,10 +2627,14 @@ def query_likelihood_scores(model, tokenizer, query, docs, batch_tokens=40000):
         ends = torch.tensor([len(seqs[k]) for k in idx], device=device)
         pos = ends[:, None] - len(q) - 1 + torch.arange(len(q), device=device)[None, :]
         hq = h[torch.arange(len(idx), device=device)[:, None], pos]
-        lp = model.lm_head(hq).float().log_softmax(-1)
-        tgt = torch.tensor(q, device=device)[None, :, None].expand(len(idx), -1, 1)
-        scores[torch.tensor(idx)] = lp.gather(2, tgt).squeeze(-1).mean(-1).cpu()
-        del h, hq, lp
+        tgt = torch.tensor(q, device=device)
+        for c0 in range(0, len(idx), row_chunk):
+            # cross-entropy over a few rows at a time: no full-vocabulary log-softmax copy for long queries
+            lg = model.lm_head(hq[c0 : c0 + row_chunk]).float()
+            nll = F.cross_entropy(lg.reshape(-1, lg.shape[-1]), tgt.repeat(lg.shape[0]), reduction="none").view(lg.shape[0], -1)
+            scores[torch.tensor(idx[c0 : c0 + row_chunk])] = (-nll.mean(-1)).cpu()
+            del lg, nll
+        del h, hq
         i = j
     return scores
 
