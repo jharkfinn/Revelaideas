@@ -5,7 +5,7 @@
 Reads <dir>/candidates_<name>.pt (phase2b_bm25.py) and writes <dir>/run_<model>_<name>.pt =
 {qid: {docid: score}}. Every model reads the same truncated document text (text_trunc).
 
-Models:
+Models (default: ce-minilm only, as a sanity check of the candidates and the eval code; the others are optional):
   ce-minilm    cross-encoder/ms-marco-MiniLM-L-6-v2 (supervised on MS MARCO; BEIR paper reranker)
   bge-m3-rr    BAAI/bge-reranker-v2-m3 (strong supervised cross-encoder, 568M)
   contriever   facebook/contriever (unsupervised dense, mean pooling, dot product)
@@ -100,7 +100,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
     ap.add_argument("--datasets", nargs="+", required=True)
-    ap.add_argument("--models", nargs="+", default=["ce-minilm", "bge-m3-rr", "contriever", "revela-500m"])
+    ap.add_argument("--models", nargs="+", default=["ce-minilm"])
     args = ap.parse_args()
     ce = {"ce-minilm": "cross-encoder/ms-marco-MiniLM-L-6-v2", "bge-m3-rr": "BAAI/bge-reranker-v2-m3"}
     for name in args.datasets:
