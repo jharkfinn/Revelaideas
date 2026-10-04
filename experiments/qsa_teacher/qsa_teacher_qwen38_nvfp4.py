@@ -402,6 +402,15 @@ def fast_indexer_forward(self, hidden_states, position_embeddings, attention_mas
     if not torch.equal(vis[:, 0], causal.expand(B, -1, -1)):
         return qm.Qwen4ExpTextQSAIndexer._reference_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
     r, d, Hq = self.compress_ratio, self.index_head_dim, self.index_n_heads
+    if Tk // r <= self.block_topk:
+        # Every complete block is selected and the tail tokens are always kept, so the selection mask equals
+        # the causal mask. Only the cache needs the raw indexer keys.
+        if past_key_values is not None:
+            token_k = torch.split(self.index_qk_proj(hidden_states), [Hq * d, d], dim=-1)[1]
+            past_key_values.update_indexer(token_k.reshape(B, Tq, d), self.layer_idx)
+        if attention_mask.is_floating_point():
+            return torch.where(vis, attention_mask.new_zeros(()), torch.finfo(attention_mask.dtype).min)
+        return vis
     full_cos, full_sin = position_embeddings
     cur_cos, cur_sin = full_cos[:, -Tq:, :], full_sin[:, -Tq:, :]
     q, token_k = torch.split(self.index_qk_proj(hidden_states), [Hq * d, d], dim=-1)
@@ -2492,6 +2501,280 @@ def rerank_signals_from_store(model, store, ex, temps):
 
 
 @app.function(hide_code=True)
+def segment_max(w, seg, n):
+    """w [..., T]; seg [T] chunk index in 0..n (n = outside every chunk) -> [..., n] max (-inf for an empty chunk)."""
+    out = torch.full((*w.shape[:-1], n + 1), float("-inf"), dtype=torch.float32, device=w.device)
+    out.scatter_reduce_(w.dim() - 1, seg.expand(w.shape).contiguous(), w.float(), reduce="amax", include_self=True)
+    return out[..., :n]
+
+
+@app.function(hide_code=True)
+def attention_logits_side(attn, x, cos, sin, rows):
+    """Dense attention logits of all heads for the query rows and the value-output norm of every token.
+
+    Returns logits [R, Hq, T] fp32 (-inf after the row, scaled as in the module) and vnorm [T, Hq] =
+    ||v_t W_O^h|| (the vector that head h writes into the residual stream per unit of attention on token t,
+    before the output gate)."""
+    T, dh = x.shape[0], attn.head_dim
+    query, _ = torch.chunk(attn.q_proj(x[rows]).view(rows.numel(), -1, dh * 2), 2, dim=-1)
+    q = qm.apply_rotary_pos_emb(attn.q_norm(query), cos=cos[rows], sin=sin[rows], unsqueeze_dim=1)
+    k = qm.apply_rotary_pos_emb(attn.k_norm(attn.k_proj(x).view(T, -1, dh)), cos=cos, sin=sin, unsqueeze_dim=1)
+    v = attn.v_proj(x).view(T, -1, dh)
+    Hq, rep = q.shape[1], q.shape[1] // k.shape[1]
+    logits = torch.einsum("rhd,thd->rht", q.float(), k.repeat_interleave(rep, dim=1).float()) * attn.scaling
+    logits = logits.masked_fill(torch.arange(T, device=x.device)[None, None, :] > rows[:, None, None], float("-inf"))
+    w_o = attn.o_proj.weight
+    vnorm = torch.stack([(v[:, h // rep] @ w_o[:, h * dh : (h + 1) * dh].T).float().norm(dim=-1) for h in range(Hq)], -1)
+    return logits, vnorm
+
+
+@app.function(hide_code=True)
+def rerank_maxsim_signals(model, store, ex, temps):
+    """rerank_signals_from_store plus late-interaction (MaxSim) and value-weighted signals, query rows only.
+
+    Extra keys (L QSA layers, K documents, H = 4 indexer heads, Hq = 24 attention heads):
+      ms      [L, 6, K]: indexer MaxSim, mean over query rows of max over the document's blocks of
+                         0 sum_h ReLU(q_h . k_b) (the score I), 1 sum_h max_b ReLU(q_h . k_b) (per head),
+                         2 sum_h max_b (q_h . k_b) on the position-free dims, 3 sum_h max_b cos(q_h, k_b),
+                         4 the same cosine on the position-free dims, 5 max_b of I z-normalized per row
+      ms_head [L, 3, H, K]: per indexer head: max dot, max cosine, max position-free cosine
+      att_ms  [L, 2, Hq, K]: per attention head: max logit over the document's tokens, and the same after
+                         z-normalizing each row's logits
+      att_vw  [L, Hq, K]: value-weighted attention mass: sum over the document of a_t ||v_t W_O^h||,
+                         normalized per row and head"""
+    out = rerank_signals_from_store(model, store, ex, temps)
+    device = model.lm_head.weight.device
+    spans, K = ex["spans"], len(ex["spans"])
+    rows = ex["q_rows"].to(device)
+    T = int(ex["ids"].shape[1])
+    seg_tok = torch.full((T,), K, dtype=torch.long, device=device)
+    for k, (s, e) in enumerate(spans):
+        seg_tok[s:e] = k
+    extra = {k: [] for k in ("ms", "ms_head", "att_ms", "att_vw")}
+    for li in sorted(store):
+        x, (cos, sin) = store[li]
+        x, cos, sin = x[0], cos[0], sin[0]
+        attn = model.model.layers[li].self_attn
+        r, rd = attn.indexer.compress_ratio, cos.shape[-1]
+        q, kbar = qsa_index_parts(attn.indexer, x, cos, sin)
+        qr, kf = q[rows].float(), kbar.float()
+        nb = kf.shape[0]
+        seg_blk = seg_tok[: nb * r : r]
+        valid = torch.arange(nb, device=device)[None, :] < ((rows + 1) // r)[:, None]
+        neg = float("-inf")
+        dots = torch.einsum("rhd,bd->rhb", qr, kf)
+        nope = torch.einsum("rhd,bd->rhb", qr[..., rd:], kf[:, rd:])
+        cosf = torch.einsum("rhd,bd->rhb", F.normalize(qr, dim=-1), F.normalize(kf, dim=-1))
+        cosn = torch.einsum("rhd,bd->rhb", F.normalize(qr[..., rd:], dim=-1), F.normalize(kf[:, rd:], dim=-1))
+        vm = valid[:, None, :]
+        I = torch.relu(dots).sum(1).masked_fill(~valid, neg)
+        Iv = I.masked_fill(~valid, 0.0)
+        cnt = valid.sum(-1, keepdim=True).clamp_min(1)
+        mu = Iv.sum(-1, keepdim=True) / cnt
+        sd = (((Iv - mu) ** 2) * valid).sum(-1, keepdim=True).div(cnt).sqrt().clamp_min(1e-6)
+        Iz = ((I - mu) / sd).masked_fill(~valid, neg)
+        per_head = [segment_max(t.masked_fill(~vm, neg), seg_blk, K) for t in (torch.relu(dots), nope, cosf, cosn)]
+        ms = torch.stack([segment_max(I, seg_blk, K).mean(0)] + [p.sum(1).mean(0) for p in per_head]
+                         + [segment_max(Iz, seg_blk, K).mean(0)])
+        extra["ms"].append(ms)
+        extra["ms_head"].append(torch.stack([per_head[0].mean(0), per_head[2].mean(0), per_head[3].mean(0)]))
+        logits, vnorm = attention_logits_side(attn, x, cos, sin, rows)
+        fin = torch.isfinite(logits)
+        lz = logits.masked_fill(~fin, 0.0)
+        n = fin.sum(-1, keepdim=True).clamp_min(1)
+        lmu = lz.sum(-1, keepdim=True) / n
+        lsd = (((lz - lmu) ** 2) * fin).sum(-1, keepdim=True).div(n).sqrt().clamp_min(1e-6)
+        extra["att_ms"].append(torch.stack([segment_max(logits, seg_tok, K).mean(0),
+                                            segment_max(((logits - lmu) / lsd).masked_fill(~fin, neg), seg_tok, K).mean(0)]))
+        w = logits.softmax(-1) * vnorm.T[None]
+        w = w / w.sum(-1, keepdim=True).clamp_min(1e-12)
+        extra["att_vw"].append(segment_sum(w, seg_tok, K).mean(0))
+        del logits, lz, w, dots, nope, cosf, cosn
+    out.update({k: torch.stack(v).float().cpu() for k, v in extra.items()})
+    return out
+
+
+@app.function(hide_code=True)
+@torch.no_grad()
+def query_likelihood_scores(model, tokenizer, query, docs, batch_tokens=40000):
+    """UPR-style relevance: mean log p(query token | document, instruction) over the query tokens, one short
+    sequence per document, batched with right padding (causal, so real rows never see the padding).
+
+    Sequence: chat prompt "Document: {doc}\\n\\nWrite a search query for this document." then the assistant
+    turn (non-thinking) with the query. Returns a tensor [len(docs)] (higher = more relevant). A null-document
+    calibration would subtract one constant per query and does not change the ranking."""
+    device = model.lm_head.weight.device
+    def enc(s):
+        return tokenizer(s, add_special_tokens=False).input_ids
+    head = enc("<|im_start|>user\nDocument: ")
+    tail = enc("\n\nWrite a search query for this document.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    q = enc(query)
+    seqs = [head + enc(d) + tail + q for d in docs]
+    scores = torch.empty(len(docs))
+    order = sorted(range(len(seqs)), key=lambda i: len(seqs[i]))
+    i = 0
+    while i < len(order):
+        j = i
+        while j < len(order) and (j - i + 1) * len(seqs[order[j]]) <= batch_tokens:
+            j += 1
+        j = max(j, i + 1)
+        idx = order[i:j]
+        L = max(len(seqs[k]) for k in idx)
+        ids = torch.full((len(idx), L), 198, dtype=torch.long)
+        for r, k in enumerate(idx):
+            ids[r, : len(seqs[k])] = torch.tensor(seqs[k])
+        h = model.model(ids.to(device), use_cache=False).last_hidden_state
+        ends = torch.tensor([len(seqs[k]) for k in idx], device=device)
+        pos = ends[:, None] - len(q) - 1 + torch.arange(len(q), device=device)[None, :]
+        hq = h[torch.arange(len(idx), device=device)[:, None], pos]
+        lp = model.lm_head(hq).float().log_softmax(-1)
+        tgt = torch.tensor(q, device=device)[None, :, None].expand(len(idx), -1, 1)
+        scores[torch.tensor(idx)] = lp.gather(2, tgt).squeeze(-1).mean(-1).cpu()
+        del h, hq, lp
+        i = j
+    return scores
+
+
+@app.function(hide_code=True)
+def start_upr_job(model, tokenizer, datasets, cand_dir, max_queries=None, tag="upr"):
+    """Query-likelihood scores (query_likelihood_scores) for the BM25 candidates of every query, in a background
+    thread. Saves <cand_dir>/run_<tag>_<dataset>.pt as {qid: {docid: score}} (the format of the baseline runs)."""
+    import threading, traceback
+    thread_name = f"qsa-upr-{tag}"
+    if any(t.name == thread_name and t.is_alive() for t in threading.enumerate()):
+        raise RuntimeError(f"a {thread_name} job is already running")
+    state = {"status": "running", "progress": "", "error": None, "t0": time.time(), "per_dataset_s": {}, "stop": False}
+
+    def work():
+        try:
+            for name in datasets:
+                data = torch.load(os.path.join(cand_dir, f"candidates_{name}.pt"), weights_only=False)
+                path = os.path.join(cand_dir, f"run_{tag}_{name}.pt")
+                run = torch.load(path, weights_only=False) if os.path.exists(path) else {}
+                t_ds = time.time()
+                qids = phase2b_subset(name, data["queries"], (max_queries or {}).get(name))
+                for n_done, qid in enumerate(qids):
+                    if state["stop"]:
+                        torch.save(run, path)
+                        state["status"] = "stopped"
+                        return
+                    if qid in run:
+                        continue
+                    docids = [d for d, _ in data["cands"][qid]]
+                    if docids:
+                        sc = query_likelihood_scores(model, tokenizer, data["queries"][qid], [data["docs"][d]["text_trunc"] for d in docids])
+                        run[qid] = dict(zip(docids, sc.tolist()))
+                    else:
+                        run[qid] = {}
+                    if len(run) % 25 == 0:
+                        torch.save(run, path)
+                    state["progress"] = f"{name} {n_done + 1}/{len(qids)} ({time.time() - state['t0']:.0f}s)"
+                torch.save(run, path)
+                state["per_dataset_s"][name] = time.time() - t_ds
+            state["status"] = "finished"
+        except Exception:
+            state["status"] = "error"
+            state["error"] = traceback.format_exc()
+
+    state["thread"] = threading.Thread(target=work, name=thread_name, daemon=True)
+    state["thread"].start()
+    return state
+
+
+@app.function(hide_code=True)
+def indexer_head_mass(indexer, x, cos, sin, rows, seg_blk, K, temps=(1.0, 1.414)):
+    """Softmax mass per indexer head: for head h, softmax over blocks of ReLU(q_h . k_b) / sqrt(d) / tau, summed
+    over each document's blocks and averaged over rows. Returns [H, len(temps), K]."""
+    r, d = indexer.compress_ratio, indexer.index_head_dim
+    q, kbar = qsa_index_parts(indexer, x, cos, sin)
+    s = torch.relu(torch.einsum("rhd,bd->rhb", q[rows].float(), kbar.float())) / math.sqrt(d)
+    valid = torch.arange(kbar.shape[0], device=x.device)[None, :] < ((rows + 1) // r)[:, None]
+    s = s.masked_fill(~valid[:, None, :], float("-inf"))
+    return torch.stack([segment_sum((s / t).softmax(-1), seg_blk, K).mean(0) for t in temps], 1)
+
+
+@app.function(hide_code=True)
+def rerank_rows_signals(model, store, ex, temps):
+    """Signals for two row sets: the query tokens (keys as in rerank_signals_from_store) and the decision-point
+    rows after the query (the end-of-turn and assistant-header tokens, keys prefixed with "mid_"), plus the
+    per-indexer-head softmax mass for both row sets ("ihead" [L, 2 row sets, H, 2 taus, K], taus 1 and 1.414)."""
+    T = int(ex["ids"].shape[1])
+    q_end = int(ex["q_rows"][-1]) + 1
+    ex_mid = dict(ex, q_rows=torch.arange(q_end, T))
+    out = rerank_signals_from_store(model, store, ex, temps)
+    out.update({f"mid_{k}": v for k, v in rerank_signals_from_store(model, store, ex_mid, temps).items()})
+    device = model.lm_head.weight.device
+    K = len(ex["spans"])
+    seg_tok = torch.full((T,), K, dtype=torch.long, device=device)
+    for k, (s, e) in enumerate(ex["spans"]):
+        seg_tok[s:e] = k
+    ih = []
+    for li in sorted(store):
+        x, (cos, sin) = store[li]
+        x, cos, sin = x[0], cos[0], sin[0]
+        indexer = model.model.layers[li].self_attn.indexer
+        nb = x.shape[0] // indexer.compress_ratio
+        seg_blk = seg_tok[: nb * indexer.compress_ratio : indexer.compress_ratio]
+        ih.append(torch.stack([indexer_head_mass(indexer, x, cos, sin, rr.to(device), seg_blk, K)
+                               for rr in (ex["q_rows"], ex_mid["q_rows"])]))
+    out["ihead"] = torch.stack(ih).float().cpu()
+    return out
+
+
+@app.function(hide_code=True)
+def build_congress_pool(tokenizer, base="/root/models/obliq/tip-of-tongue/congress", k=50, max_doc_tokens=1024,
+                        out="/root/models/phase2b/candidates_congress.pt"):
+    """Congress Hearings (OBLIQ-Bench) verification pool: the gold passage plus k - 1 hard negatives, first from
+    the gold's own hearing (same people, topic and vocabulary), then from the other hearings that hold golds.
+    Random choices use crc32(qid) seeds. Saved in the candidates_<name>.pt format (cands in random order with
+    score 0, since there is no first-stage ranking). base: the congress folder of the dianetc/OBLIQ-Bench
+    dataset (tip-of-tongue/congress). Returns pool statistics."""
+    import json, zlib
+    queries = {json.loads(l)["_id"]: json.loads(l)["text"] for l in open(f"{base}/queries+qrels/queries.jsonl")}
+    qrels = {}
+    for line in open(f"{base}/queries+qrels/qrels.tsv"):
+        q, d, s = line.rstrip("\n").split("\t")
+        if q != "query-id":
+            qrels[q] = {d: int(s)}
+    hearing = lambda d: d.split("_p")[0]
+    gold_h = {hearing(d) for v in qrels.values() for d in v}
+    by_h, text = {}, {}
+    for line in open(f"{base}/corpus/corpus.jsonl"):
+        r = json.loads(line)
+        h = hearing(r["_id"])
+        if h in gold_h:
+            by_h.setdefault(h, []).append(r["_id"])
+            text[r["_id"]] = r["text"]
+    other_pool = sorted(text)
+    cands, n_same = {}, []
+    for q in sorted(qrels):
+        gold = next(iter(qrels[q]))
+        g = torch.Generator().manual_seed(zlib.crc32(f"congress/{q}".encode()))
+        same = [d for d in by_h[hearing(gold)] if d != gold]
+        same = [same[i] for i in torch.randperm(len(same), generator=g)[: k - 1].tolist()]
+        rest = [d for d in other_pool if hearing(d) != hearing(gold)]
+        fill = [rest[i] for i in torch.randperm(len(rest), generator=g)[: k - 1 - len(same)].tolist()]
+        pool = [gold] + same + fill
+        pool = [pool[i] for i in torch.randperm(len(pool), generator=g).tolist()]
+        cands[q] = [(d, 0.0) for d in pool]
+        n_same.append(len(same))
+    docs = {}
+    for q, c in cands.items():
+        for d, _ in c:
+            if d not in docs:
+                ids = tokenizer(" ".join(text[d].split()), add_special_tokens=False).input_ids[:max_doc_tokens]
+                docs[d] = dict(text=text[d], ids=ids, text_trunc=tokenizer.decode(ids))
+    data = dict(name="congress", index="obliq-congress-same-hearing-pool", k=k, max_doc_tokens=max_doc_tokens,
+                queries={q: queries[q] for q in qrels}, qrels=qrels, cands=cands, docs=docs)
+    torch.save(data, out)
+    gold_tok = sorted(len(docs[next(iter(qrels[q]))]["ids"]) for q in qrels)
+    cut = sum(len(tokenizer(" ".join(text[next(iter(qrels[q]))].split()), add_special_tokens=False).input_ids) > max_doc_tokens for q in qrels)
+    qtok = sorted(len(tokenizer(queries[q], add_special_tokens=False).input_ids) for q in qrels)
+    return dict(queries=len(qrels), mean_same_hearing_negs=round(sum(n_same) / len(n_same), 1), min_same=min(n_same),
+                docs=len(docs), gold_tokens_median=gold_tok[len(gold_tok) // 2], golds_cut=cut, query_tokens_median=qtok[len(qtok) // 2])
+
+
+@app.function(hide_code=True)
 def rerank_doc_order(dataset, qid, n):
     """Fixed random permutation of the n BM25 candidates for one query (seed = crc32 of 'dataset/qid')."""
     import zlib
@@ -2512,18 +2795,22 @@ def phase2b_subset(dataset, qids, n=None):
 
 @app.cell(hide_code=True)
 def _(extract_teacher_multi):
-    def start_rerank_job(model, tokenizer, datasets, cand_dir, temps, out_dir=None, tag="qsa", last_layer=None, max_queries=None):
+    def start_rerank_job(model, tokenizer, datasets, cand_dir, temps, out_dir=None, tag="qsa", last_layer=None, max_queries=None,
+                         signals_fn=None):
         """Phase 2b teacher extraction in a background thread. For every query: the BM25 candidates in a fixed
         random order, one prefix pass, then the query and the null query "N/A" as one suffix batch. Results go
         to <out_dir>/teacher_<tag>_<dataset>.pt as {qid: dict(docids, q, null)}, saved every 25 queries so
         the job can resume. A query without BM25 candidates gets docids = [] and q = null = None.
         last_layer: stop the passes after this decoder layer (signals only for the QSA layers up to it).
-        max_queries: {dataset: n} runs only the fixed subset phase2b_subset(dataset, qids, n)."""
+        max_queries: {dataset: n} runs only the fixed subset phase2b_subset(dataset, qids, n).
+        signals_fn(model, store, ex): the signals of one prompt variant (default: rerank_signals_from_store
+        with temps; rerank_maxsim_signals and rerank_rows_signals add more signals)."""
         import threading, traceback
         thread_name = f"qsa-rerank-{tag}"
         if any(t.name == thread_name and t.is_alive() for t in threading.enumerate()):
             raise RuntimeError(f"a {thread_name} job is already running; two jobs would share the GPU and the output files")
         out_dir = out_dir or cand_dir
+        fn = signals_fn or (lambda m, s, e: rerank_signals_from_store(m, s, e, temps))
         state = {"status": "running", "progress": "", "error": None, "t0": time.time(), "per_dataset_s": {}, "stop": False}
 
         def work():
@@ -2550,7 +2837,7 @@ def _(extract_teacher_multi):
                         texts = [data["docs"][d]["text_trunc"] for d in docids]
                         group = [build_rerank_example(tokenizer, q, texts) for q in (data["queries"][qid], "N/A")]
                         sig_q, sig_null = extract_teacher_multi(
-                            model, [group], signals_fn=lambda m, s, e: rerank_signals_from_store(m, s, e, temps), last_layer=last_layer)[0]
+                            model, [group], signals_fn=fn, last_layer=last_layer)[0]
                         recs[qid] = dict(docids=docids, q=sig_q, null=sig_null, n_tokens=int(group[0]["ids"].shape[1]))
                         if len(recs) % 25 == 0:
                             torch.save(recs, path)

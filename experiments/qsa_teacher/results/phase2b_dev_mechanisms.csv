@@ -1,0 +1,58 @@
+run,step,signal,rows,calibrated,macro,dl19,dl20,trec-covid,nfcorpus,scifact,fiqa
+ms,1 select,"indexer softmax mass, layer 31, tau 1",query,yes,0.5906,0.603,0.568,0.751,0.35,0.79,0.481
+ms,3 attend,QRHead-16 dense attention mass,query,yes,0.6072,0.638,0.592,0.772,0.353,0.789,0.499
+ms,2 match,"indexer MaxSim, sum over heads (score I), layer 31",query,no,0.4517,,,,,,
+ms,2 match,"indexer MaxSim, sum over heads (score I), layer 31",query,yes,0.525,,,,,,
+ms,2 match,"indexer MaxSim, max per head (ReLU dot), layer 31",query,no,0.4632,,,,,,
+ms,2 match,"indexer MaxSim, max per head (ReLU dot), layer 31",query,yes,0.5434,,,,,,
+ms,2 match,"indexer MaxSim, max per head, position-free dims, layer 31",query,no,0.4285,,,,,,
+ms,2 match,"indexer MaxSim, max per head, position-free dims, layer 31",query,yes,0.4968,,,,,,
+ms,2 match,"indexer MaxSim, max per head, cosine, layer 31",query,no,0.4667,,,,,,
+ms,2 match,"indexer MaxSim, max per head, cosine, layer 31",query,yes,0.5414,,,,,,
+ms,2 match,"indexer MaxSim, max per head, cosine, position-free dims, layer 31",query,no,0.4425,,,,,,
+ms,2 match,"indexer MaxSim, max per head, cosine, position-free dims, layer 31",query,yes,0.5,,,,,,
+ms,2 match,"indexer MaxSim, row z-normalized I, layer 31",query,no,0.4423,,,,,,
+ms,2 match,"indexer MaxSim, row z-normalized I, layer 31",query,yes,0.5079,,,,,,
+ms,2 match,"indexer head 0 MaxSim (dot), layer 31",query,no,0.3626,,,,,,
+ms,2 match,"indexer head 0 MaxSim (dot), layer 31",query,yes,0.4285,,,,,,
+ms,2 match,"indexer head 1 MaxSim (dot), layer 31",query,no,0.418,,,,,,
+ms,2 match,"indexer head 1 MaxSim (dot), layer 31",query,yes,0.3883,,,,,,
+ms,2 match,"indexer head 2 MaxSim (dot), layer 31",query,no,0.223,,,,,,
+ms,2 match,"indexer head 2 MaxSim (dot), layer 31",query,yes,0.3558,,,,,,
+ms,2 match,"indexer head 3 MaxSim (dot), layer 31",query,no,0.4647,,,,,,
+ms,2 match,"indexer head 3 MaxSim (dot), layer 31",query,yes,0.5108,,,,,,
+ms,2 match,"attention-logit MaxSim, QRHead-16",query,no,0.4758,,,,,,
+ms,2 match,"attention-logit MaxSim, QRHead-16",query,yes,0.5543,,,,,,
+ms,2 match,"attention-logit MaxSim, QRHead-16, row z-normalized",query,no,0.4743,,,,,,
+ms,2 match,"attention-logit MaxSim, QRHead-16, row z-normalized",query,yes,0.541,,,,,,
+ms,2 match,"attention-logit MaxSim, all 24 heads of layer 31",query,no,0.4533,,,,,,
+ms,2 match,"attention-logit MaxSim, all 24 heads of layer 31",query,yes,0.532,,,,,,
+ms,2 match,"attention-logit MaxSim, all 24 heads of layer 31, row z-normalized",query,no,0.449,,,,,,
+ms,2 match,"attention-logit MaxSim, all 24 heads of layer 31, row z-normalized",query,yes,0.5244,,,,,,
+ms,4 write,"value-weighted attention, QRHead-16",query,no,0.5273,,,,,,
+ms,4 write,"value-weighted attention, QRHead-16",query,yes,0.6044,0.632,0.585,0.769,0.353,0.788,0.499
+ms,4 write,"value-weighted attention, all 24 heads of layer 31",query,no,0.5007,,,,,,
+ms,4 write,"value-weighted attention, all 24 heads of layer 31",query,yes,0.5863,,,,,,
+ms,3 attend,"dense attention, all 24 heads of layer 31",query,no,0.5094,,,,,,
+ms,3 attend,"dense attention, all 24 heads of layer 31",query,yes,0.5885,,,,,,
+ms,4 write,"value-weighted attention, all 216 heads of layers 3-35",query,no,0.4595,,,,,,
+ms,4 write,"value-weighted attention, all 216 heads of layers 3-35",query,yes,0.5684,,,,,,
+ms,3 attend,"dense attention, all 216 heads of layers 3-35",query,no,0.4639,,,,,,
+ms,3 attend,"dense attention, all 216 heads of layers 3-35",query,yes,0.574,,,,,,
+upr,5 use,"query likelihood (UPR), one document in context",-,-,0.5624,0.595,0.608,0.669,0.36,0.661,0.482
+upr,3+5,"QRHead-16 + query likelihood, z-score sum 1:1",query,yes,0.6306,0.657,0.653,0.775,0.374,0.798,0.526
+upr,-,MiniLM-L6 cross-encoder,-,-,0.5957,0.727,0.675,0.741,0.346,0.683,0.403
+upr,-,BM25,-,-,0.4804,0.506,0.48,0.595,0.32,0.69,0.293
+rows,1 select,"indexer softmax mass, layer 31, tau 1",decision point,yes,0.6014,0.633,0.602,0.762,0.334,0.789,0.488
+rows,1 select,"indexer softmax mass, layer 31, tau 1",query + decision point (sum),yes,0.6165,0.656,0.607,0.785,0.356,0.804,0.492
+rows,3 attend,QRHead-16 dense attention mass,decision point,yes,0.6011,0.628,0.624,0.741,0.332,0.784,0.497
+rows,3 attend,QRHead-16 dense attention mass,query + decision point (sum),yes,0.6264,0.662,0.629,0.795,0.358,0.806,0.508
+rows,3 attend,"dense attention, all 24 heads of layer 31",decision point,yes,0.5944,0.611,0.599,0.743,0.327,0.793,0.492
+rows,1 select,"indexer head 0 softmax mass, layer 31, tau 1",query,yes,0.4631,,,,,,
+rows,1 select,"indexer head 0 softmax mass, layer 31, tau 1",decision point,yes,0.5252,,,,,,
+rows,1 select,"indexer head 1 softmax mass, layer 31, tau 1",query,yes,0.4984,,,,,,
+rows,1 select,"indexer head 1 softmax mass, layer 31, tau 1",decision point,yes,0.5466,,,,,,
+rows,1 select,"indexer head 2 softmax mass, layer 31, tau 1",query,yes,0.3983,,,,,,
+rows,1 select,"indexer head 2 softmax mass, layer 31, tau 1",decision point,yes,0.3136,,,,,,
+rows,1 select,"indexer head 3 softmax mass, layer 31, tau 1",query,yes,0.5397,,,,,,
+rows,1 select,"indexer head 3 softmax mass, layer 31, tau 1",decision point,yes,0.5464,,,,,,

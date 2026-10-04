@@ -1,0 +1,10 @@
+comparison,delta_macro,ci_lo,ci_hi
+query likelihood - QRHead-16,-0.0448,-0.0649,-0.0241
+query likelihood - indexer L31,-0.0281,-0.0495,-0.0069
+query likelihood - MiniLM,-0.0333,-0.0548,-0.0114
+query likelihood - BM25,0.082,0.0572,0.1073
+indexer L31: decision point - query rows,0.0108,-0.0044,0.0258
+QRHead-16: decision point - query rows,-0.0061,-0.0207,0.0082
+QRHead-16: both row sets - query rows,0.0192,0.0125,0.0261
+indexer head 3 alone - sum of 4 heads (query rows),-0.0509,-0.0668,-0.0353
+indexer L31 decision point - QRHead-16 query rows,-0.0058,-0.021,0.0091

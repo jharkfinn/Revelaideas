@@ -105,6 +105,9 @@ Lessons for long runs on molab:
 - `set_ui_value` on a run button already runs the cell. A second explicit `run_cell` runs it again and starts a second job. `start_rerank_job` now refuses to start while a job thread with the same name is alive.
 - In scratchpad code, keep large tensors inside functions, because loop variables and failed calls can keep GPU memory alive.
 - Do not give Triton kernels names that start with `_`. marimo renames such names, and Triton then cannot find the function.
+- Editing a cell that the model-load cell depends on (for example `fast_indexer_forward`) re-runs the load cell, which then stops without its button and removes `model`. Old scratchpad namespaces can still hold the model, so free them before you press **Load** again.
+- The scratchpad renames names that start with `_`, also inside lambdas that a background thread calls later. Use plain names in such code.
+- A molab sandbox can end without warning (HTTP 410 "sandbox terminated"). Copy results and notebook edits into the repository after each run.
 - `pyserini` 2.4 installs torch 2.14, numpy 2.5 and a CUDA 13 stack. In the molab venv these shadowed the system torch 2.11. Run pyserini in a separate process (`phase2b_bm25.py`, with `JAVA_HOME` set), and remove the extra torch, triton, numpy, `nvidia-*` and `cuda-*` packages from the venv after the install.
 
 ## Phase 2 pilot: does the indexer point at the gold passage?
@@ -197,6 +200,70 @@ The rows below are the paired bootstrap of the primary teacher minus each system
 - One prompt template, not tuned.
 - Documents are cut at 256 tokens.
 - The model runs W4A16, while vLLM serves this checkpoint as W4A4.
+
+## Phase 2b, part 2: which signal inside the model is the most retrieval-like?
+
+All rows use the dev tier (447 queries, macro nDCG@10; `results/phase2b_dev_mechanisms*.csv`).
+
+**Why the indexer does not beat the heads.** The report (Eqs. 17 and 18) trains the indexer with KL(â_i ‖ softmax(I_i)):
+- â_i is the attention of all heads of the layer, summed, L1-normalized and max-pooled per block;
+- I_i is the vector of indexer scores of query token i over the blocks.
+
+So the indexer copies the mean of all 24 heads of its layer, and it copies it well:
+- per layer, it is within 0.026 of the sum of that layer's heads (layer 31: 0.590 against 0.587);
+- the per-query Spearman correlation with that sum is 0.88 after calibration.
+
+The selected heads win by dropping the heads that attend for other reasons:
+- QRHead-16 gives 0.606;
+- all 72 heads of layers 27, 31 and 35 together give 0.588.
+
+The trained distribution is also too sharp for ranking. At the trained scale (τ = 1/√128):
+- only 15% of the indexer mass falls on the documents;
+- the macro nDCG is 0.501.
+
+Our 0.590 comes from a softmax that is 11× flatter.
+
+**Steps a document goes through, and the best signal at each:**
+
+| Step | Signal | Macro |
+|---|---|---:|
+| 1. Select | indexer softmax mass, layer 31 (query rows) | 0.591 |
+| 2. Match | best MaxSim: indexer, max per head, calibrated | 0.543 |
+| 2. Match | attention-logit MaxSim, QRHead-16 | 0.554 |
+| 3. Attend | QRHead-16 attention mass | 0.607 |
+| 4. Write | value-weighted attention α‖v W_O‖, QRHead-16 | 0.604 |
+| 5. Use | query likelihood (UPR), one document in context | 0.562 |
+| 3 + 5 | QRHead-16 + query likelihood, z-score sum 1:1 | **0.631** |
+| reference | MiniLM-L6 cross-encoder | 0.596 |
+
+- **MaxSim loses about 0.05 against the softmax mass, for the indexer and for the heads.** For one query token i and document d:
+
+  log mass_id = LSE_{j∈d}(s_ij) − LSE_{j∈all}(s_ij)
+
+  where s_ij is the match score of token i with position j and LSE is log-sum-exp. The first term adds a soft count of matches. The second term normalizes each row, which acts like an in-context IDF. MaxSim has neither.
+- **Value weighting adds nothing.** The null calibration already removes the sink effect.
+- **Query likelihood alone is weaker but carries different information.**
+  - Its Spearman correlation with the attention signals is 0.35.
+  - It loses most on SciFact. There, documents that refute the claim count as relevant, but they make the claim less likely.
+  - Combined with QRHead-16, it beats both inputs on all 6 sets.
+- **Rows.** The decision-point rows are the end-of-turn and assistant-header tokens after the query.
+  - The indexer read there gives 0.601, now level with QRHead-16 on query rows: −0.006 [−0.021, +0.009].
+  - Summing the two row sets gives 0.617 for the indexer and 0.626 for QRHead-16. The QRHead-16 gain is +0.019 [+0.013, +0.026].
+- **Single indexer heads.** None beats the sum of the 4 heads; the best, head 3, is 0.051 lower. Head 2 looks positional.
+
+## OBLIQ-Bench Congress Hearings (planned; the run was lost)
+
+OBLIQ-Bench (arXiv 2605.06235) Congress Hearings: 254 Reddit-style recollections, 213,650 hearing passages and one gold passage per query. The golds are concentrated: 60 of 1,304 hearings hold all of them, and 10 tech hearings hold 55%.
+
+`build_congress_pool` builds a verification pool:
+- the gold plus 49 negatives, first from the gold's own hearing (44.8 on average, at least 15), then from the other gold hearings;
+- passages cut at 1,024 tokens, which cuts 21 golds.
+
+This removes the topic shortcut and tests whether the teacher can find the exchange inside its hearing. For random order, NDCG@10 is 0.091 and R@10 is 0.20.
+
+The planned systems were the indexer and QRHead-16 on both row sets, query likelihood and MiniLM. Query likelihood mirrors how the queries were made: an LLM wrote each query from its gold passage. Read its result with that in mind.
+
+The molab sandbox ended during this run (HTTP 410), so there are no Congress numbers yet.
 
 ## Corrections to the earlier plan
 
