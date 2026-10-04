@@ -14,6 +14,7 @@ Revela-style dense retriever.
 | QSA scorer | `qsa_index_parts`, `qsa_block_scores` and `qsa_select_blocks` compute the indexer scores for all rows at once. `qsa_block_scores` can also return the dot products split into the RoPE part (dims 0 to 63) and the position-free part (dims 64 to 127). `fast_indexer_forward` replaces the per-query Python loop in `Qwen4ExpTextQSAIndexer.forward`. It works with and without a KV cache, and it falls back to the reference code when the mask has padding. |
 | Attention side path | `attention_side_path` recomputes any QSA layer for chosen query rows: dense or sparse probabilities for all 24 heads, head outputs, and the elementwise sigmoid output gate. `indexer_selection_tokens` gives the token-level top-512 selection. |
 | Phase 2 pilot | `build_rag_example` (chat format, non-thinking, passages padded or cut to exactly 160 tokens = 40 blocks), `extract_teacher_signals` (chunk-level teacher signals per layer and head), `start_pilot_job` (runs in a background thread), `pilot_score_table` and `pilot_cv_report` (gold-rank metrics; every head and layer choice is made on the other half of the questions). |
+| Speed path | `nvfp4_dequant_kernel` (Triton), `grouped_experts_forward`, `use_fla_gdn`, `use_compiled_hyper_connections`, `use_flex_attention`, `use_fast_path`, `extract_teacher_batch` and `extract_teacher_multi` (batched prefix and suffix passes on an expanded KV cache), `start_pilot_job_fast`. |
 | Tests | `nvfp4_unit_tests` and `tiny_parity` (random-weight model with the real attention geometry), `indexer_parity` and `selection_tie_stats` (real model), the side-path check against the module output, and `profile_forward`. |
 
 ## Phase 1 results: loader and scorer (4 Oct 2026)
@@ -31,6 +32,43 @@ Revela-style dense retriever.
   | 10,400 | 7.0 | 4.65 s | 1.16 s | 0.53 s | 76.6 GiB |
 
   The NVFP4 expert path takes 67% to 89% of the time. It decodes all 512 experts in 48 layers in every pass and runs a Python loop over the experts.
+
+## Speed path (fast enough to iterate)
+
+`use_fast_path()` switches on five patches. Each one can be turned off on its own to compare with the reference path:
+
+| Patch | What it does | 10,260-token forward |
+|---|---|---:|
+| Reference | per-expert loop, PyTorch NVFP4 decode, PyTorch GDN, eager hyper-connections, SDPA | 7.0 s |
+| `use_grouped_experts` | Triton NVFP4 decode at about 1 TB/s into a reusable buffer, decode only the experts that get tokens, `torch._grouped_mm`, one weighted `bmm` to combine the 10 expert outputs per token | 3.6 s |
+| `use_fla_gdn` | `flash-linear-attention` kernels for the Gated DeltaNet layers (rebinds the functions in the loaded module) | 2.79 s |
+| `use_compiled_hyper_connections` | `torch.compile` of the gated-residual module, one graph shared by all instances | 2.47 s |
+| `use_flex_attention` | FlexAttention with a block mask built from the causal and indexer mask, for queries of 1,024 rows or more | 2.28 s |
+
+The pilot extraction (`extract_teacher_multi`) adds three more savings:
+- the question and the null question share one cached prefix pass;
+- all suffixes run as one right-padded batch, which is safe because attention is causal;
+- 3 questions run per pass (peak 87 GiB; 4 questions need 91 GiB).
+
+| Pilot | Reference path | Fast path |
+|---|---:|---:|
+| One K = 64 question (question + null) | 27.3 s | 2.27 s |
+| K = 16, 96 questions | 864 s | 94 s |
+| K = 64, 64 questions | 1,750 s | 145 s |
+
+**Parity.**
+- The grouped experts reproduce the per-expert loop exactly (logit KL 0).
+- The fla kernels, the compiled hyper-connections, FlexAttention and the KV-cache continuation each change the bf16 numeric path. Each step shifts the WikiText logits by a KL of about 0.015 to 0.02, with top-1 agreement of about 96%. Per GDN call, fla differs from the reference by 3.4e-3 relative error, about twice the reference's own bf16 error against fp32.
+- On the teacher signal the fast pilot agrees with the reference pilot (`results/pilot_fast_cv_report_*.csv`):
+  - the Spearman correlation of the indexer chunk masses is 0.993 (K = 16) and 0.996 (K = 64);
+  - layers 31 and 35 give the same gold rank on 81% to 91% of questions;
+  - every cross-validated MRR and nDCG is within 0.02, except the native top-512 share at K = 64 (0.42 → 0.34);
+  - the indexer-vs-dense conclusion does not change.
+
+Lessons for long runs on molab:
+- Run long jobs in a background thread (`start_pilot_job*`). When an HTTP request to the kernel is cancelled, marimo interrupts the running cell.
+- In scratchpad code, keep large tensors inside functions, because loop variables and failed calls can keep GPU memory alive.
+- Do not give Triton kernels names that start with `_`. marimo renames such names, and Triton then cannot find the function.
 
 ## Phase 2 pilot: does the indexer point at the gold passage?
 
@@ -78,4 +116,4 @@ Other findings:
 3. Run the cells, then press **Load**. The load takes about 75 s from a local disk.
 4. Press **Run pilot**. It runs in a background thread for about 30 minutes, so a dropped browser or HTTP request cannot interrupt it. Then run the loader cell below it.
 
-Requirements: `transformers==5.18.0` (it has `qwen4_exp`), `torch>=2.11` with CUDA, `safetensors`, `datasets`, and `polars`.
+Requirements: `transformers==5.18.0` (it has `qwen4_exp`), `torch>=2.11` with CUDA (Triton 3.6), `flash-linear-attention==0.5.2`, `safetensors`, `datasets`, and `polars`.

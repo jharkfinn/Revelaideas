@@ -1,6 +1,7 @@
 # /// script
 # requires-python = ">=3.13"
 # dependencies = [
+#     "flash-linear-attention==0.5.2",
 #     "numpy==2.4.6",
 #     "safetensors==0.8.0",
 #     "transformers==5.18.0",
@@ -1368,6 +1369,552 @@ def profile_forward(model, ids):
     return dict(total_s=total, **{k + "_s": v for k, v in times.items()})
 
 
+@app.cell
+def _():
+    mo.md(r"""
+    ## Speed path
+
+    Profiling showed the NVFP4 expert path at 67% to 89% of each forward pass. The PyTorch decode makes many passes with int64
+    temporaries, and the per-expert loop launches about 200K small kernels per pass. The speed path keeps the same W4A16 math:
+
+    - `nvfp4_dequant_kernel` (Triton) decodes NVFP4 to bf16 at memory bandwidth into a reusable buffer.
+    - `grouped_experts_forward` sorts the (token, expert) pairs and runs all experts of a chunk with `torch._grouped_mm`.
+    - `use_fla_gdn` swaps the Gated DeltaNet reference loops for the `flash-linear-attention` Triton kernels.
+
+    Each patch is a switch, so the original path stays available for parity checks.
+    """)
+    return
+
+
+@app.cell
+def _():
+    import triton
+    import triton.language as tl
+
+    return tl, triton
+
+
+@app.cell
+def _(tl, triton):
+    @triton.jit
+    def nvfp4_e2m1_to_f32(c):
+        mag = c & 7
+        e = mag >> 1
+        m = (mag & 1).to(tl.float32)
+        p = tl.where(e == 1, 1.0, tl.where(e == 2, 2.0, 4.0))
+        v = tl.where(e == 0, 0.5 * m, (1.0 + 0.5 * m) * p)
+        return tl.where(c >= 8, -v, v)
+
+    return (nvfp4_e2m1_to_f32,)
+
+
+@app.cell
+def _(nvfp4_e2m1_to_f32, tl, triton):
+    @triton.jit
+    def nvfp4_dequant_kernel(q_ptr, s_ptr, g_ptr, out_ptr, KH, KS, ROWS_PER_G, BLOCK: tl.constexpr):
+        row = tl.program_id(0).to(tl.int64)
+        cb = tl.program_id(1)
+        j = cb * BLOCK + tl.arange(0, BLOCK)
+        mask = j < KH
+        b = tl.load(q_ptr + row * KH + j, mask=mask, other=0).to(tl.int32)
+        s8 = tl.load(s_ptr + row * KS + j // 8, mask=mask, other=0)
+        sc = s8.to(tl.float8e4nv, bitcast=True).to(tl.float32) * tl.load(g_ptr + row // ROWS_PER_G)
+        lo = nvfp4_e2m1_to_f32(b & 15) * sc
+        hi = nvfp4_e2m1_to_f32(b >> 4) * sc
+        out = tl.reshape(tl.join(lo, hi), (2 * BLOCK,))
+        o = 2 * cb * BLOCK + tl.arange(0, 2 * BLOCK)
+        tl.store(out_ptr + row * (2 * KH) + o, out.to(tl.bfloat16), mask=o < 2 * KH)
+
+    return (nvfp4_dequant_kernel,)
+
+
+@app.cell
+def _(nvfp4_dequant_kernel, triton):
+    def dequant_nvfp4_triton(w_u8, scale_u8, scale2_groups, rows_per_group, out=None, block=256):
+        """w_u8 [G?, N, K/2] uint8, scale_u8 [.., N, K/16], scale2_groups fp32 flat [rows / rows_per_group].
+        Same math and rounding as dequant_nvfp4: bf16(e2m1 * (fp8(scale) * scale2))."""
+        N2 = w_u8.shape[-1]
+        rows = w_u8.numel() // N2
+        if out is None:
+            out = torch.empty(*w_u8.shape[:-1], 2 * N2, dtype=torch.bfloat16, device=w_u8.device)
+        grid = (rows, triton.cdiv(N2, block))
+        nvfp4_dequant_kernel[grid](w_u8, scale_u8, scale2_groups, out, N2, scale_u8.shape[-1], rows_per_group, BLOCK=block)
+        return out
+
+    return (dequant_nvfp4_triton,)
+
+
+@app.cell
+def _(dequant_nvfp4_triton):
+    def grouped_experts_forward(self, hidden_states, top_k_index, top_k_weights):
+        """NVFP4Experts forward: Triton dequant of the experts that received tokens (into a reusable
+        buffer), torch._grouped_mm per chunk of experts, then one weighted bmm to combine the K outputs
+        of each token (W4A16, same math as the per-expert loop)."""
+        T, K = top_k_index.shape
+        E, H, I = self.num_experts, self.hidden_dim, self.intermediate_dim
+        chunk = getattr(self, "grouped_chunk", 256)
+        dev = hidden_states.device
+        flat = top_k_index.reshape(-1)
+        order = torch.argsort(flat, stable=True)
+        counts = torch.bincount(flat, minlength=E)
+        tok = order // K
+        xs = hidden_states[tok]
+        hit = torch.nonzero(counts).flatten()
+        n_hit = hit.numel()
+        all_hit = n_hit == E
+        ends = counts[hit].cumsum(0)
+        ends_l = ends.tolist()
+        cache = type(self).__dict__.get("grouped_buffers")
+        if cache is None:
+            cache = {}
+            type(self).grouped_buffers = cache
+        buf = cache.get((dev, chunk))
+        if buf is None:
+            buf = (torch.empty(chunk, 2 * I, H, dtype=torch.bfloat16, device=dev),
+                   torch.empty(chunk, H, I, dtype=torch.bfloat16, device=dev))
+            cache[(dev, chunk)] = buf
+        out_sorted = torch.empty(T * K, H, dtype=hidden_states.dtype, device=dev)
+        for c0 in range(0, n_hit, chunk):
+            c1 = min(n_hit, c0 + chunk)
+            n = c1 - c0
+            r0 = ends_l[c0 - 1] if c0 > 0 else 0
+            r1 = ends_l[c1 - 1]
+            if all_hit:
+                sl = slice(c0, c1)
+                gq, gs, gg = self.gu_q[sl], self.gu_s[sl], self.gu_g[sl]
+                dq, ds, dg = self.d_q[sl], self.d_s[sl], self.d_g[sl]
+            else:
+                ids = hit[c0:c1]
+                gq, gs, gg = self.gu_q.index_select(0, ids), self.gu_s.index_select(0, ids), self.gu_g.index_select(0, ids)
+                dq, ds, dg = self.d_q.index_select(0, ids), self.d_s.index_select(0, ids), self.d_g.index_select(0, ids)
+            wgu = dequant_nvfp4_triton(gq, gs, gg.reshape(-1), I, out=buf[0][:n])
+            wd = dequant_nvfp4_triton(dq, ds, dg, H, out=buf[1][:n])
+            offs = (ends[c0:c1] - r0).to(torch.int32)
+            h = torch._grouped_mm(xs[r0:r1], wgu.transpose(1, 2), offs=offs)
+            h = F.silu(h[:, :I]) * h[:, I:]
+            out_sorted[r0:r1] = torch._grouped_mm(h, wd.transpose(1, 2), offs=offs)
+        # Combine the K expert outputs of each token: back to (token, slot) order, then one weighted bmm
+        # (fp32 accumulation, same bf16 result as an fp32 index_add followed by the bf16 cast).
+        unsorted = torch.empty_like(out_sorted)
+        unsorted[order] = out_sorted
+        return torch.bmm(top_k_weights.to(unsorted.dtype)[:, None, :], unsorted.view(T, K, H)).squeeze(1)
+
+    return (grouped_experts_forward,)
+
+
+@app.cell
+def _(grouped_experts_forward):
+    def use_grouped_experts(enabled=True, chunk=256):
+        """Switch NVFP4Experts.forward between the grouped-GEMM path and the original per-expert loop."""
+        cls = NVFP4Experts
+        if "loop_forward" not in cls.__dict__:
+            cls.loop_forward = cls.forward
+        cls.grouped_chunk = chunk
+        cls.forward = grouped_experts_forward if enabled else cls.loop_forward
+        if not enabled and "grouped_buffers" in cls.__dict__:
+            cls.grouped_buffers.clear()
+        return enabled
+
+    return (use_grouped_experts,)
+
+
+@app.function
+def use_fla_gdn(enabled=True):
+    """Rebind the Gated DeltaNet chunk / recurrent functions of the loaded qwen4_exp module to the
+    flash-linear-attention kernels (transformers binds them at import time, before fla was installed)."""
+    import inspect
+    if "reference_chunk_gdr" not in qm.__dict__:
+        qm.reference_chunk_gdr = qm.torch_chunk_gated_delta_rule
+        qm.reference_recurrent_gdr = qm.torch_recurrent_gated_delta_rule
+    if not enabled:
+        qm.torch_chunk_gated_delta_rule = qm.reference_chunk_gdr
+        qm.torch_recurrent_gated_delta_rule = qm.reference_recurrent_gdr
+        return False
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+
+    def wrap(fn):
+        params = set(inspect.signature(fn).parameters)
+        def call(*args, **kwargs):
+            return fn(*args, **{k: v for k, v in kwargs.items() if k in params})
+        return call
+
+    qm.torch_chunk_gated_delta_rule = wrap(chunk_gated_delta_rule)
+    qm.torch_recurrent_gated_delta_rule = wrap(fused_recurrent_gated_delta_rule)
+    return True
+
+
+@app.function
+def signals_from_store(model, store, ex):
+    """Chunk-level teacher signals from captured attention inputs (same outputs as extract_teacher_signals).
+
+    store[layer] = (x [1, T, D], (cos, sin) [1, T, rot]) covering every position of ex["ids"].
+    """
+    device = model.lm_head.weight.device
+    spans = ex["spans"]
+    nq, na = ex["q_rows"].numel(), ex["a_rows"].numel()
+    rows = torch.cat([ex["q_rows"], ex["a_rows"]]).to(device)
+    groups = [slice(0, nq), slice(nq, nq + na), slice(0, nq + na)]
+    out = {k: [] for k in ("idx", "sel", "dense", "sparse", "gate", "gnorm")}
+    for li in sorted(store):
+        x, (cos, sin) = store[li]
+        x, cos, sin = x[0], cos[0], sin[0]
+        attn = model.model.layers[li].self_attn
+        r, d = attn.indexer.compress_ratio, attn.indexer.index_head_dim
+        tok, sc, selb = indexer_selection_tokens(attn.indexer, x, cos, sin, rows)
+        valid = sc["valid"]
+        neg = float("-inf")
+        s_rope = (torch.relu(sc["dots_rope"]).sum(-1) / math.sqrt(d)).masked_fill(~valid, neg)
+        s_nope = (torch.relu(sc["dots_nope"]).sum(-1) / math.sqrt(d)).masked_fill(~valid, neg)
+        full = sc["score"]
+        masses = [torch.stack([(v * scale).softmax(-1)[:, s // r : e // r].sum(-1) for s, e in spans], -1)
+                  for scale in (1.0, math.sqrt(d)) for v in (full, s_rope, s_nope)]
+        finite = full.masked_fill(~valid, 0.0)
+        mean_sc = torch.stack([finite[:, s // r : e // r].mean(-1) for s, e in spans], -1)
+        max_sc = torch.stack([full[:, s // r : e // r].amax(-1) for s, e in spans], -1)
+        idx = torch.stack(masses + [mean_sc, max_sc], 1)
+        sel = torch.stack([selb[:, s // r : e // r].float().mean(-1) for s, e in spans], -1)
+        sp = attention_side_path(attn, x, cos, sin, rows, tok)
+        de = attention_side_path(attn, x, cos, sin, rows, None)
+        dense, sparse = chunk_mass(de["probs"], spans), chunk_mass(sp["probs"], spans)
+        gate = sp["gate"].mean(-1)
+        gnorm = (sp["o"].float() * sp["gate"]).norm(dim=-1)
+        out["idx"].append(torch.stack([idx[g].mean(0) for g in groups]))
+        out["sel"].append(torch.stack([sel[g].mean(0) for g in groups]))
+        out["dense"].append(torch.stack([dense[g].mean(0) for g in groups], 1))
+        out["sparse"].append(torch.stack([sparse[g].mean(0) for g in groups], 1))
+        out["gate"].append(torch.stack([gate[g].mean(0) for g in groups], 1))
+        out["gnorm"].append(torch.stack([gnorm[g].mean(0) for g in groups], 1))
+    return {k: torch.stack(v).float().cpu() for k, v in out.items()}
+
+
+@app.function
+@torch.no_grad()
+def extract_teacher_pair(model, examples):
+    """Teacher signals for several variants of one prompt that share everything before the question
+    (e.g. the real question and the null question). The shared prefix runs once with a KV cache;
+    each variant then runs only its own suffix on a copy of the cache. Returns one dict per variant."""
+    import copy
+    device = model.lm_head.weight.device
+    q0 = int(examples[0]["q_rows"][0])
+    prefix = examples[0]["ids"][:, :q0]
+    for ex in examples[1:]:
+        if int(ex["q_rows"][0]) != q0 or not torch.equal(ex["ids"][:, :q0], prefix):
+            raise ValueError("variants must share the prefix before the question")
+    store_p, hooks = capture_attention_inputs(model)
+    try:
+        cache = model.model(prefix.to(device), use_cache=True).past_key_values
+    finally:
+        for h in hooks:
+            h.remove()
+    results = []
+    for i, ex in enumerate(examples):
+        c = cache if i == len(examples) - 1 else copy.deepcopy(cache)
+        store_s, hooks = capture_attention_inputs(model)
+        try:
+            model.model(ex["ids"][:, q0:].to(device), past_key_values=c, use_cache=True)
+        finally:
+            for h in hooks:
+                h.remove()
+        store = {li: (torch.cat([store_p[li][0], store_s[li][0]], dim=1), store_s[li][1]) for li in store_s}
+        results.append(signals_from_store(model, store, ex))
+        del store, store_s, c
+    return results
+
+
+@app.function
+def expand_cache_batch(cache, n):
+    """Repeat a batch-1 DynamicCache (attention KV, indexer keys, GDN conv / recurrent states, n-gram
+    context, bound position ids) to batch n, in place."""
+    def rep(t):
+        return t.expand(n, *t.shape[1:]).contiguous() if torch.is_tensor(t) and t.dim() > 0 and t.shape[0] == 1 else t
+    for layer in cache.layers:
+        for name, val in list(vars(layer).items()):
+            if torch.is_tensor(val):
+                setattr(layer, name, rep(val))
+            elif isinstance(val, dict):
+                setattr(layer, name, {k: rep(v) for k, v in val.items()})
+    pid = getattr(cache, "position_ids", None)
+    if pid is not None:
+        cache.position_ids = pid.expand(pid.shape[0], n, pid.shape[2]).contiguous()
+    return cache
+
+
+@app.function
+@torch.no_grad()
+def extract_teacher_batch(model, examples, pad_id=198):
+    """Teacher signals for prompt variants that share everything before the question: one prefix pass
+    with a KV cache, then all suffixes together as one right-padded batch on the expanded cache.
+    Right padding is safe: every row we read lies before its padding and attention is causal."""
+    device = model.lm_head.weight.device
+    q0 = int(examples[0]["q_rows"][0])
+    prefix = examples[0]["ids"][:, :q0]
+    for ex in examples[1:]:
+        if int(ex["q_rows"][0]) != q0 or not torch.equal(ex["ids"][:, :q0], prefix):
+            raise ValueError("variants must share the prefix before the question")
+    store_p, hooks = capture_attention_inputs(model)
+    try:
+        cache = model.model(prefix.to(device), use_cache=True).past_key_values
+    finally:
+        for h in hooks:
+            h.remove()
+    suffixes = [ex["ids"][0, q0:] for ex in examples]
+    L = max(s.numel() for s in suffixes)
+    batch = torch.full((len(examples), L), pad_id, dtype=torch.long)
+    for i, s in enumerate(suffixes):
+        batch[i, : s.numel()] = s
+    expand_cache_batch(cache, len(examples))
+    store_s, hooks = capture_attention_inputs(model)
+    try:
+        model.model(batch.to(device), past_key_values=cache, use_cache=True)
+    finally:
+        for h in hooks:
+            h.remove()
+    del cache
+    results = []
+    for i, ex in enumerate(examples):
+        n_i = suffixes[i].numel()
+        t_i = q0 + n_i
+        store = {li: (torch.cat([store_p[li][0], store_s[li][0][i : i + 1, :n_i]], dim=1),
+                      (store_s[li][1][0][i : i + 1, :t_i], store_s[li][1][1][i : i + 1, :t_i]))
+                 for li in store_s}
+        results.append(signals_from_store(model, store, ex))
+        del store
+    return results
+
+
+@app.function
+def repeat_cache_rows(cache, v):
+    """Repeat every batch row of a DynamicCache v times (row b -> rows b*v .. b*v+v-1), in place."""
+    def rep(t):
+        return t.repeat_interleave(v, dim=0) if torch.is_tensor(t) and t.dim() > 0 else t
+    for layer in cache.layers:
+        for name, val in list(vars(layer).items()):
+            if torch.is_tensor(val):
+                setattr(layer, name, rep(val))
+            elif isinstance(val, dict):
+                setattr(layer, name, {k: rep(x) for k, x in val.items()})
+    pid = getattr(cache, "position_ids", None)
+    if pid is not None:
+        cache.position_ids = pid.repeat_interleave(v, dim=1)
+    return cache
+
+
+@app.function
+@torch.no_grad()
+def extract_teacher_multi(model, groups, pad_id=198):
+    """Teacher signals for several questions at once. groups[i] is the list of prompt variants of
+    question i (e.g. [question, null]); variants of one question share everything before the
+    question, and all questions must have the same prefix length. One batched prefix pass with a KV
+    cache, then one right-padded batch with every variant's suffix. Returns results[i][variant]."""
+    device = model.lm_head.weight.device
+    Q, V = len(groups), len(groups[0])
+    q0 = int(groups[0][0]["q_rows"][0])
+    prefixes = []
+    for g in groups:
+        if len(g) != V or any(int(ex["q_rows"][0]) != q0 for ex in g):
+            raise ValueError("all questions need the same number of variants and the same prefix length")
+        if any(not torch.equal(ex["ids"][:, :q0], g[0]["ids"][:, :q0]) for ex in g[1:]):
+            raise ValueError("variants of one question must share the prefix")
+        prefixes.append(g[0]["ids"][:, :q0])
+    store_p, hooks = capture_attention_inputs(model)
+    try:
+        cache = model.model(torch.cat(prefixes).to(device), use_cache=True).past_key_values
+    finally:
+        for h in hooks:
+            h.remove()
+    suffixes = [ex["ids"][0, q0:] for g in groups for ex in g]
+    L = max(s.numel() for s in suffixes)
+    batch = torch.full((Q * V, L), pad_id, dtype=torch.long)
+    for i, s in enumerate(suffixes):
+        batch[i, : s.numel()] = s
+    repeat_cache_rows(cache, V)
+    store_s, hooks = capture_attention_inputs(model)
+    try:
+        model.model(batch.to(device), past_key_values=cache, use_cache=True)
+    finally:
+        for h in hooks:
+            h.remove()
+    del cache
+    results = []
+    for qi, g in enumerate(groups):
+        res_q = []
+        for vi, ex in enumerate(g):
+            row = qi * V + vi
+            n_i = suffixes[row].numel()
+            t_i = q0 + n_i
+            store = {li: (torch.cat([store_p[li][0][qi : qi + 1], store_s[li][0][row : row + 1, :n_i]], dim=1),
+                          (store_s[li][1][0][row : row + 1, :t_i], store_s[li][1][1][row : row + 1, :t_i]))
+                     for li in store_s}
+            res_q.append(signals_from_store(model, store, ex))
+            del store
+        results.append(res_q)
+    return results
+
+
+@app.function
+def use_compiled_hyper_connections(enabled=True):
+    """torch.compile the gated-residual (hyper-connection) forward shared by all 97 instances.
+    Module parameters are graph inputs (inline_inbuilt_nn_modules), so instances share one graph."""
+    import torch._dynamo
+    cls = qm.Qwen4ExpTextGatedResidual
+    if "eager_forward" not in cls.__dict__:
+        cls.eager_forward = cls.forward
+    if not enabled:
+        cls.forward = cls.eager_forward
+        return False
+    torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+    if "compiled_forward" not in cls.__dict__:
+        cls.compiled_forward = torch.compile(cls.eager_forward, dynamic=None)
+    cls.forward = cls.compiled_forward
+    return True
+
+
+@app.function
+def use_flex_attention(enabled=True, min_query_len=1024):
+    """Route QSA attention with >= min_query_len query rows through FlexAttention with a block mask
+    built from the boolean (causal & indexer) mask; shorter queries keep SDPA."""
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    reg = ALL_ATTENTION_FUNCTIONS._global_mapping
+    if "sdpa_reference" not in qm.__dict__:
+        qm.sdpa_reference = reg["sdpa"]
+    if not enabled:
+        reg["sdpa"] = qm.sdpa_reference
+        return False
+    if "flex_compiled" not in qm.__dict__:
+        qm.flex_compiled = torch.compile(flex_attention, dynamic=False)
+
+    def sdpa_or_flex(module, query, key, value, attention_mask, dropout=0.0, scaling=None, **kwargs):
+        if (query.shape[2] < min_query_len or attention_mask is None or attention_mask.dtype != torch.bool
+                or not isinstance(module, qm.Qwen4ExpTextAttention)):
+            return qm.sdpa_reference(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, **kwargs)
+        B, _, Tq, _ = query.shape
+        Tk = key.shape[2]
+        m = attention_mask[:, 0]
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return m[b, q_idx, kv_idx]
+
+        bm = create_block_mask(mask_mod, B, None, Tq, Tk, device=query.device)
+        out = qm.flex_compiled(query, key, value, block_mask=bm, scale=scaling, enable_gqa=True)
+        return out.transpose(1, 2).contiguous(), None
+
+    reg["sdpa"] = sdpa_or_flex
+    return True
+
+
+@app.cell
+def _(use_grouped_experts):
+    def use_fast_path(enabled=True):
+        """All speed switches at once: grouped NVFP4 experts, fla GDN kernels, vectorized indexer,
+        compiled hyper-connections, FlexAttention for long queries. enabled=False restores the reference path."""
+        use_grouped_experts(enabled)
+        use_fla_gdn(enabled)
+        use_fast_indexer(enabled)
+        use_compiled_hyper_connections(enabled)
+        use_flex_attention(enabled)
+        return enabled
+
+    return (use_fast_path,)
+
+
+@app.function
+def start_pilot_job_fast(model, tokenizer, pilot_sets, out_dir="/root/models", tag="fast", questions_per_batch=2):
+    """Pilot in a background thread with the fast extraction: questions are processed in batches of
+    `questions_per_batch` (one batched prefix pass + one batched suffix pass per batch, the question
+    and the null question share the prefix). Results go to `<out_dir>/pilot_<tag>_nq_<regime>.pt`."""
+    import threading
+    import traceback
+    state = {"status": "running", "progress": "", "error": None, "t0": time.time(), "per_regime_s": {}}
+    for regime in pilot_sets:
+        path = os.path.join(out_dir, f"pilot_{tag}_nq_{regime}.pt")
+        if os.path.exists(path):
+            os.remove(path)
+
+    def work():
+        try:
+            for regime, examples in pilot_sets.items():
+                t_reg = time.time()
+                recs = []
+                for b0 in range(0, len(examples), questions_per_batch):
+                    batch = examples[b0 : b0 + questions_per_batch]
+                    groups = [[build_rag_example(tokenizer, q, ex["passages"], ex["answer"]) for q in (ex["question"], "N/A")]
+                              for ex in batch]
+                    for ex, (sig_q, sig_null) in zip(batch, extract_teacher_multi(model, groups)):
+                        recs.append(dict(gold=ex["gold"], q=sig_q, null=sig_null))
+                    state["progress"] = f"{regime} {len(recs)}/{len(examples)} ({time.time() - state['t0']:.0f}s)"
+                torch.save(recs, os.path.join(out_dir, f"pilot_{tag}_nq_{regime}.pt"))
+                state["per_regime_s"][regime] = time.time() - t_reg
+            state["status"] = "finished"
+        except Exception:
+            state["status"] = "error"
+            state["error"] = traceback.format_exc()
+
+    state["thread"] = threading.Thread(target=work, name=f"qsa-pilot-{tag}", daemon=True)
+    state["thread"].start()
+    return state
+
+
+@app.cell
+def _():
+    fast_pilot_button = mo.ui.run_button(label="Run fast pilot (both regimes, 3 questions per pass)")
+    fast_pilot_button
+    return (fast_pilot_button,)
+
+
+@app.cell
+def _(fast_pilot_button, model, pilot_sets, tokenizer, use_fast_path):
+    mo.stop(not fast_pilot_button.value, mo.md("Press **Run fast pilot**. It runs in a background thread; results go to `/root/models/pilot_fast_nq_<regime>.pt`."))
+    use_fast_path(True)
+    fast_pilot_job = start_pilot_job_fast(model, tokenizer, pilot_sets, questions_per_batch=3)
+    mo.md("Fast pilot started in a background thread. Run the next cell to compare with the reference-path pilot.")
+    return (fast_pilot_job,)
+
+
+@app.cell
+def _(fast_pilot_job, pilot_runs, pilot_sets):
+    fast_pilot_job["progress"]
+    fast_runs = {_k: torch.load(f"/root/models/pilot_fast_nq_{_k}.pt") for _k in pilot_sets if os.path.exists(f"/root/models/pilot_fast_nq_{_k}.pt")}
+    _rows = []
+    for _k, _recs in fast_runs.items():
+        _tf, _bf = pilot_cv_report(_recs)
+        _ts, _bs = pilot_cv_report(pilot_runs[_k])
+        _j = _ts.join(_tf, on="teacher", suffix="_fast")
+        _rows.append(mo.vstack([
+            mo.md(f"**{_k}**: reference path {_k} vs fast path ({fast_pilot_job['per_regime_s'].get(_k, float('nan')):.0f} s for {len(_recs)} questions). "
+                  f"Indexer (CV, calibrated) minus dense top-16: reference nDCG {_bs['ndcg_at_10'][0]:+.3f}, fast nDCG {_bf['ndcg_at_10'][0]:+.3f}."),
+            mo.ui.table(_j.select("teacher", "mrr", "mrr_fast", "ndcg_at_10", "ndcg_at_10_fast").with_columns(pl.col("mrr", "mrr_fast", "ndcg_at_10", "ndcg_at_10_fast").round(3)), selection=None, page_size=10),
+        ]))
+    mo.vstack([mo.md(f"Fast pilot: **{fast_pilot_job['status']}**, {fast_pilot_job['progress']}")] + _rows)
+    return
+
+
+@app.cell
+def _():
+    mo.md(r"""
+    ### Speed path results (4 Oct 2026)
+
+    | Measure | Reference path | Fast path |
+    |---|---:|---:|
+    | One 10,260-token forward pass (one sequence) | 7.0 s | 2.28 s |
+    | One K = 64 question, question + null pass | 27.3 s | 2.27 s (3 questions per batch) |
+    | Pilot K = 16, 96 questions | 864 s | 94 s |
+    | Pilot K = 64, 64 questions | 1,750 s | 145 s |
+
+    Steps, each a switch inside `use_fast_path` (forward at 10,260 tokens): grouped NVFP4 experts with the Triton
+    decode (7.0 s to 3.6 s, bit-identical logits), fla GDN kernels (to 2.79 s), compiled hyper-connections
+    (to 2.47 s), FlexAttention for long queries (to 2.28 s). On top of that, the pilot shares one prefix pass between the
+    question and the null question, runs both suffixes as one right-padded batch, and processes 3 questions per pass.
+
+    **Parity.** The grouped experts reproduce the per-expert loop exactly (logit KL 0). The fla GDN kernels, the
+    compiled hyper-connections, FlexAttention and the KV-cache continuation each change the bf16 numeric path (each step
+    shifts WikiText logits by a KL of about 0.015 to 0.02; top-1 agreement about 96%). On the teacher signal, the fast pilot
+    agrees with the reference pilot: Spearman of the indexer chunk masses 0.993 (K = 16) and 0.996 (K = 64), the same gold rank for 81% to 91% of
+    questions at layers 31 and 35, and cross-validated MRR / nDCG within 0.02 for every teacher except the native
+    top-512 share at K = 64 (0.42 to 0.34; that teacher counts discrete block shares and flips on small score changes).
+    """)
+    return
+
+
 if __name__ == "__main__":
     app.run()
-
