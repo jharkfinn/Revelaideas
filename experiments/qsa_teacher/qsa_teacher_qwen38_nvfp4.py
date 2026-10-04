@@ -3,6 +3,7 @@
 # dependencies = [
 #     "flash-linear-attention==0.5.2",
 #     "numpy==2.4.6",
+#     "pytrec-eval-terrier==0.5.10",
 #     "safetensors==0.8.0",
 #     "transformers==5.18.0",
 # ]
@@ -1491,8 +1492,15 @@ def _(dequant_nvfp4_triton):
             wd = dequant_nvfp4_triton(dq, ds, dg, H, out=buf[1][:n])
             offs = (ends[c0:c1] - r0).to(torch.int32)
             h = torch._grouped_mm(xs[r0:r1], wgu.transpose(1, 2), offs=offs)
-            h = F.silu(h[:, :I]) * h[:, I:]
+            silu_mul_fn = type(self).__dict__.get("silu_mul_fn")
+            h = silu_mul_fn(h, I) if silu_mul_fn is not None else F.silu(h[:, :I]) * h[:, I:]
             out_sorted[r0:r1] = torch._grouped_mm(h, wd.transpose(1, 2), offs=offs)
+        combine_fn = type(self).__dict__.get("combine_fn")
+        if combine_fn is not None:
+            # compiled gather + weighted sum (use_fused_glue)
+            inv = torch.empty_like(order)
+            inv[order] = torch.arange(order.numel(), device=dev)
+            return combine_fn(out_sorted, inv, top_k_weights, T, K)
         # Combine the K expert outputs of each token: back to (token, slot) order, then one weighted bmm
         # (fp32 accumulation, same bf16 result as an fp32 index_add followed by the bf16 cast).
         unsorted = torch.empty_like(out_sorted)
@@ -1699,56 +1707,98 @@ def repeat_cache_rows(cache, v):
     return cache
 
 
-@app.function
-@torch.no_grad()
-def extract_teacher_multi(model, groups, pad_id=198):
-    """Teacher signals for several questions at once. groups[i] is the list of prompt variants of
-    question i (e.g. [question, null]); variants of one question share everything before the
-    question, and all questions must have the same prefix length. One batched prefix pass with a KV
-    cache, then one right-padded batch with every variant's suffix. Returns results[i][variant]."""
-    device = model.lm_head.weight.device
-    Q, V = len(groups), len(groups[0])
-    q0 = int(groups[0][0]["q_rows"][0])
-    prefixes = []
-    for g in groups:
-        if len(g) != V or any(int(ex["q_rows"][0]) != q0 for ex in g):
-            raise ValueError("all questions need the same number of variants and the same prefix length")
-        if any(not torch.equal(ex["ids"][:, :q0], g[0]["ids"][:, :q0]) for ex in g[1:]):
-            raise ValueError("variants of one question must share the prefix")
-        prefixes.append(g[0]["ids"][:, :q0])
-    store_p, hooks = capture_attention_inputs(model)
-    try:
-        cache = model.model(torch.cat(prefixes).to(device), use_cache=True).past_key_values
-    finally:
-        for h in hooks:
-            h.remove()
-    suffixes = [ex["ids"][0, q0:] for g in groups for ex in g]
-    L = max(s.numel() for s in suffixes)
-    batch = torch.full((Q * V, L), pad_id, dtype=torch.long)
-    for i, s in enumerate(suffixes):
-        batch[i, : s.numel()] = s
-    repeat_cache_rows(cache, V)
-    store_s, hooks = capture_attention_inputs(model)
-    try:
-        model.model(batch.to(device), past_key_values=cache, use_cache=True)
-    finally:
-        for h in hooks:
-            h.remove()
-    del cache
-    results = []
-    for qi, g in enumerate(groups):
-        res_q = []
-        for vi, ex in enumerate(g):
-            row = qi * V + vi
-            n_i = suffixes[row].numel()
-            t_i = q0 + n_i
-            store = {li: (torch.cat([store_p[li][0][qi : qi + 1], store_s[li][0][row : row + 1, :n_i]], dim=1),
-                          (store_s[li][1][0][row : row + 1, :t_i], store_s[li][1][1][row : row + 1, :t_i]))
-                     for li in store_s}
-            res_q.append(signals_from_store(model, store, ex))
-            del store
-        results.append(res_q)
-    return results
+@app.cell(hide_code=True)
+def _():
+    class StopForward(Exception):
+        """Raised by a forward hook to end a forward pass after the last decoder layer that is needed."""
+
+
+    def run_until(model, ids, last_layer=None, **kwargs):
+        """model.model(ids, **kwargs), stopped after decoder layer `last_layer` (None = all layers).
+
+        Returns the KV cache when use_cache=True (pass past_key_values to continue a cache). Layers after
+        last_layer are never computed, and their cache entries stay empty, so a continuation must use the
+        same last_layer."""
+        n = len(model.model.layers)
+        if last_layer is None or last_layer >= n - 1:
+            return model.model(ids, **kwargs).past_key_values
+        cache = kwargs.pop("past_key_values", None)
+        if cache is None and kwargs.get("use_cache"):
+            cache = qm.DynamicCache(config=model.model.config)
+
+        def stop(module, args, output):
+            raise StopForward
+
+        hook = model.model.layers[last_layer].register_forward_hook(stop)
+        try:
+            model.model(ids, past_key_values=cache, **kwargs)
+        except StopForward:
+            pass
+        finally:
+            hook.remove()
+        return cache
+
+
+    return (run_until,)
+
+
+@app.cell
+def extract_teacher_multi(run_until):
+    @torch.no_grad()
+    def extract_teacher_multi(model, groups, pad_id=198, signals_fn=None, last_layer=None):
+        """Teacher signals for several questions at once. groups[i] is the list of prompt variants of
+        question i (e.g. [question, null]); variants of one question share everything before the
+        question, and all questions must have the same prefix length. One batched prefix pass with a KV
+        cache, then one right-padded batch with every variant's suffix. Returns results[i][variant].
+        signals_fn(model, store, ex) computes the signals of one variant (default: signals_from_store).
+        last_layer: stop both passes after this decoder layer (None = all 48 layers); only the QSA layers up to it
+        are captured."""
+        signals_fn = signals_fn or signals_from_store
+        device = model.lm_head.weight.device
+        Q, V = len(groups), len(groups[0])
+        q0 = int(groups[0][0]["q_rows"][0])
+        prefixes = []
+        for g in groups:
+            if len(g) != V or any(int(ex["q_rows"][0]) != q0 for ex in g):
+                raise ValueError("all questions need the same number of variants and the same prefix length")
+            if any(not torch.equal(ex["ids"][:, :q0], g[0]["ids"][:, :q0]) for ex in g[1:]):
+                raise ValueError("variants of one question must share the prefix")
+            prefixes.append(g[0]["ids"][:, :q0])
+        store_p, hooks = capture_attention_inputs(model)
+        try:
+            cache = run_until(model, torch.cat(prefixes).to(device), last_layer, use_cache=True)
+        finally:
+            for h in hooks:
+                h.remove()
+        suffixes = [ex["ids"][0, q0:] for g in groups for ex in g]
+        L = max(s.numel() for s in suffixes)
+        batch = torch.full((Q * V, L), pad_id, dtype=torch.long)
+        for i, s in enumerate(suffixes):
+            batch[i, : s.numel()] = s
+        repeat_cache_rows(cache, V)
+        store_s, hooks = capture_attention_inputs(model)
+        try:
+            run_until(model, batch.to(device), last_layer, past_key_values=cache, use_cache=True)
+        finally:
+            for h in hooks:
+                h.remove()
+        del cache
+        results = []
+        for qi, g in enumerate(groups):
+            res_q = []
+            for vi, ex in enumerate(g):
+                row = qi * V + vi
+                n_i = suffixes[row].numel()
+                t_i = q0 + n_i
+                store = {li: (torch.cat([store_p[li][0][qi : qi + 1], store_s[li][0][row : row + 1, :n_i]], dim=1),
+                              (store_s[li][1][0][row : row + 1, :t_i], store_s[li][1][1][row : row + 1, :t_i]))
+                         for li in store_s}
+                res_q.append(signals_fn(model, store, ex))
+                del store
+            results.append(res_q)
+        return results
+
+    return (extract_teacher_multi,)
 
 
 @app.function
@@ -1769,90 +1819,431 @@ def use_compiled_hyper_connections(enabled=True):
     return True
 
 
+@app.function(hide_code=True)
+def bool_mask_to_block_mask(m, mask_mod, block=128):
+    """FlexAttention BlockMask from a dense boolean mask m [B, Tq, Tk].
+
+    Same result as create_block_mask(mask_mod, ...), without its vmap over every (q, kv) pair, which
+    builds int64 index grids of B * Tq * Tk elements (about 5 GiB at 25K tokens). Padded tail positions
+    count as masked, so tail blocks are partial and the kernel applies mask_mod inside them."""
+    from torch.nn.attention.flex_attention import BlockMask
+    B, Tq, Tk = m.shape
+    nq, nk = -(-Tq // block), -(-Tk // block)
+    mp = torch.zeros(B, nq * block, nk * block, dtype=torch.bool, device=m.device)
+    mp[:, :Tq, :Tk] = m
+    blk = mp.view(B, nq, block, nk, block)
+    any_b = blk.any(4).any(2)
+    all_b = blk.all(4).all(2)
+    del mp, blk
+
+    def to_idx(x):
+        num = x.sum(-1, dtype=torch.int32)[:, None].contiguous()
+        idx = torch.argsort(x.to(torch.int8), dim=-1, descending=True, stable=True).to(torch.int32)[:, None].contiguous()
+        return num, idx
+
+    kv_num, kv_idx = to_idx(any_b & ~all_b)
+    full_num, full_idx = to_idx(all_b)
+    return BlockMask.from_kv_blocks(kv_num, kv_idx, full_num, full_idx, BLOCK_SIZE=block, mask_mod=mask_mod,
+                                    seq_lengths=(Tq, Tk))
+
+
 @app.function
 def use_flex_attention(enabled=True, min_query_len=1024):
     """Route QSA attention with >= min_query_len query rows through FlexAttention with a block mask
-    built from the boolean (causal & indexer) mask; shorter queries keep SDPA."""
+    built from the boolean (causal & indexer) mask; shorter queries keep SDPA. The compiled kernel
+    accepts variable sequence lengths (one static compile, then one dynamic compile)."""
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-    from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+    from torch.nn.attention.flex_attention import flex_attention
     reg = ALL_ATTENTION_FUNCTIONS._global_mapping
     if "sdpa_reference" not in qm.__dict__:
         qm.sdpa_reference = reg["sdpa"]
     if not enabled:
         reg["sdpa"] = qm.sdpa_reference
         return False
-    if "flex_compiled" not in qm.__dict__:
-        qm.flex_compiled = torch.compile(flex_attention, dynamic=False)
+    if "flex_compiled_auto" not in qm.__dict__:
+        qm.flex_compiled_auto = torch.compile(flex_attention, dynamic=None)
 
     def sdpa_or_flex(module, query, key, value, attention_mask, dropout=0.0, scaling=None, **kwargs):
         if (query.shape[2] < min_query_len or attention_mask is None or attention_mask.dtype != torch.bool
                 or not isinstance(module, qm.Qwen4ExpTextAttention)):
             return qm.sdpa_reference(module, query, key, value, attention_mask, dropout=dropout, scaling=scaling, **kwargs)
-        B, _, Tq, _ = query.shape
-        Tk = key.shape[2]
         m = attention_mask[:, 0]
 
         def mask_mod(b, h, q_idx, kv_idx):
             return m[b, q_idx, kv_idx]
 
-        bm = create_block_mask(mask_mod, B, None, Tq, Tk, device=query.device)
-        out = qm.flex_compiled(query, key, value, block_mask=bm, scale=scaling, enable_gqa=True)
+        bm = bool_mask_to_block_mask(m, mask_mod)
+        out = qm.flex_compiled_auto(query, key, value, block_mask=bm, scale=scaling, enable_gqa=True)
         return out.transpose(1, 2).contiguous(), None
 
     reg["sdpa"] = sdpa_or_flex
     return True
 
 
+@app.cell(hide_code=True)
+def _(tl, triton):
+    @triton.jit
+    def qsa_attn_step(q, acc, m_i, l_i, kbase, vbase, tok, ok, sk_t, sv_t, d, sm_scale):
+        """One online-softmax step of qsa_sparse_attn_kernel over the key slots tok (ok = slot is used)."""
+        tok64 = tok.to(tl.int64)
+        k = tl.load(kbase + tok64[:, None] * sk_t + d[None, :], mask=ok[:, None], other=0.0)
+        s = tl.dot(q, tl.trans(k)) * sm_scale
+        s = tl.where(ok[None, :], s, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+        p = tl.exp(s - m_safe[:, None])
+        alpha = tl.exp(m_i - m_safe)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        v = tl.load(vbase + tok64[:, None] * sv_t + d[None, :], mask=ok[:, None], other=0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        return acc, m_new, l_i
+
+
+    return (qsa_attn_step,)
+
+
+@app.cell(hide_code=True)
+def _(qsa_attn_step, tl, triton):
+    @triton.jit
+    def qsa_sparse_attn_kernel(q_ptr, k_ptr, v_ptr, idx_ptr, o_ptr, sm_scale, q_off,
+                               sq_b, sq_h, sq_t, sk_b, sk_h, sk_t, sv_b, sv_h, sv_t, si_b, si_t, so_b, so_t, so_h,
+                               TOPK: tl.constexpr, G: tl.constexpr, GP: tl.constexpr, D: tl.constexpr,
+                               R: tl.constexpr, NB: tl.constexpr):
+        """QSA sparse attention for one query row and one KV head: the G query heads of that KV head attend
+        to the row's selected blocks (idx, block ids, -1 = none, R tokens per block) and to its tail tokens
+        ((pos + 1) // R * R .. pos). Same key set as the indexer mask of Qwen4ExpTextQSAIndexer."""
+        t = tl.program_id(0)
+        hk = tl.program_id(1)
+        b = tl.program_id(2).to(tl.int64)
+        pos = q_off + t
+        hs = tl.arange(0, GP)
+        hmask = hs < G
+        d = tl.arange(0, D)
+        q = tl.load(q_ptr + b * sq_b + (hk * G + hs)[:, None] * sq_h + t.to(tl.int64) * sq_t + d[None, :],
+                    mask=hmask[:, None], other=0.0)
+        m_i = tl.full([GP], float("-inf"), tl.float32)
+        l_i = tl.zeros([GP], tl.float32)
+        acc = tl.zeros([GP, D], tl.float32)
+        j = tl.arange(0, NB * R)
+        kbase = k_ptr + b * sk_b + hk * sk_h
+        vbase = v_ptr + b * sv_b + hk * sv_h
+        ibase = idx_ptr + b * si_b + t.to(tl.int64) * si_t
+        for i in range(0, TOPK, NB):
+            bi = tl.load(ibase + i + j // R)
+            ok = bi >= 0
+            tok = tl.where(ok, bi * R + j % R, 0)
+            acc, m_i, l_i = qsa_attn_step(q, acc, m_i, l_i, kbase, vbase, tok, ok, sk_t, sv_t, d, sm_scale)
+        tok = ((pos + 1) // R) * R + j
+        ok = (j < R) & (tok <= pos)
+        tok = tl.where(ok, tok, 0)
+        acc, m_i, l_i = qsa_attn_step(q, acc, m_i, l_i, kbase, vbase, tok, ok, sk_t, sv_t, d, sm_scale)
+        out = acc / l_i[:, None]
+        tl.store(o_ptr + b * so_b + t.to(tl.int64) * so_t + (hk * G + hs)[:, None] * so_h + d[None, :],
+                 out.to(o_ptr.dtype.element_ty), mask=hmask[:, None])
+
+
+    return (qsa_sparse_attn_kernel,)
+
+
+@app.cell(hide_code=True)
+def _(qsa_sparse_attn_kernel, triton):
+    def qsa_sparse_attention(q, k, v, idx, scale, r=4, nb=8, num_warps=4):
+        """Sparse attention over indexer-selected blocks.
+
+        q [B, Hq, Tq, D]; k, v [B, Hkv, Tk, D] (the q rows sit at positions Tk - Tq .. Tk - 1); idx [B, Tq, TOPK]
+        int32 selected block ids (-1 = none). Each row attends to its selected blocks of r tokens and to the
+        tokens of its own incomplete block. Returns [B, Tq, Hq, D] in q.dtype."""
+        B, Hq, Tq, D = q.shape
+        Hkv, Tk = k.shape[1], k.shape[2]
+        G = Hq // Hkv
+        topk = idx.shape[-1]
+        if topk % nb:
+            idx = torch.nn.functional.pad(idx, (0, nb - topk % nb), value=-1)
+        idx = idx.contiguous()
+        o = torch.empty(B, Tq, Hq, D, dtype=q.dtype, device=q.device)
+        qsa_sparse_attn_kernel[(Tq, Hkv, B)](
+            q, k, v, idx, o, scale, Tk - Tq,
+            q.stride(0), q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2), idx.stride(0), idx.stride(1), o.stride(0), o.stride(1), o.stride(2),
+            TOPK=idx.shape[-1], G=G, GP=max(16, triton.next_power_of_2(G)), D=D, R=r, NB=nb, num_warps=num_warps)
+        return o
+
+
+    return (qsa_sparse_attention,)
+
+
+@app.function(hide_code=True)
+def qsa_topk_block_ids(indexer, hidden_states, position_embeddings, past_key_values=None, chunk=2048):
+    """Indexer selection as block ids instead of a T x T mask: [B, Tq, block_topk] int32, -1 = no block.
+
+    Same scores and the same top-k set as fast_indexer_forward (unpadded causal input). Also appends the
+    raw indexer keys to the cache, as the module does."""
+    B, Tq, _ = hidden_states.shape
+    r, d, Hq = indexer.compress_ratio, indexer.index_head_dim, indexer.index_n_heads
+    full_cos, full_sin = position_embeddings
+    Tk = full_cos.shape[1]
+    q, token_k = torch.split(indexer.index_qk_proj(hidden_states), [Hq * d, d], dim=-1)
+    q = indexer.q_layernorm(q.reshape(B, Tq, Hq, d))
+    q = qm.apply_rotary_pos_emb(q, cos=full_cos[:, -Tq:, :], sin=full_sin[:, -Tq:, :], unsqueeze_dim=2)
+    raw_keys = token_k.reshape(B, Tq, d)
+    if past_key_values is not None:
+        raw_keys = past_key_values.update_indexer(raw_keys, indexer.layer_idx)
+    nb = Tk // r
+    positions = torch.arange(Tk - Tq, Tk, device=hidden_states.device)
+    ids = torch.full((B, Tq, indexer.block_topk), -1, dtype=torch.int32, device=hidden_states.device)
+    if nb == 0:
+        return ids
+    k = min(indexer.block_topk, nb)
+    starts = torch.arange(nb, device=hidden_states.device) * r
+    for b in range(B):
+        kbar = raw_keys[b, : nb * r].reshape(nb, r, d).float().mean(dim=1).to(raw_keys.dtype)
+        kbar = indexer.k_layernorm(kbar)
+        kbar = qm.apply_rotary_pos_emb(kbar.unsqueeze(1), cos=full_cos[b, starts], sin=full_sin[b, starts]).squeeze(1)
+        for c0 in range(0, Tq, chunk):
+            sl = slice(c0, min(Tq, c0 + chunk))
+            sc = qsa_block_scores(q[b, sl], kbar, positions[sl], r)["score"]
+            top = sc.topk(k, dim=-1, sorted=False)
+            ids[b, sl, :k] = torch.where(top.values > float("-inf"), top.indices, -1).to(torch.int32)
+    return ids
+
+
+@app.cell(hide_code=True)
+def _(qsa_sparse_attention):
+    def use_sparse_attention(enabled=True, min_query_len=1024):
+        """Route long QSA attention passes (>= min_query_len query rows, no cached prefix, causal mask without
+        padding) through qsa_topk_block_ids + qsa_sparse_attention: no T x T masks and no dense attention work.
+        Other calls (short suffix passes, cached continuations, padded masks) keep the module's own forward."""
+        cls = qm.Qwen4ExpTextAttention
+        if "reference_forward" not in cls.__dict__:
+            cls.reference_forward = cls.forward
+        if not enabled:
+            cls.forward = cls.reference_forward
+            return False
+
+        def sparse_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None, **kwargs):
+            B, Tq, _ = hidden_states.shape
+            plain = (attention_mask is not None and attention_mask.dtype == torch.bool and attention_mask.shape[-1] == Tq
+                     and bool(attention_mask[:, 0, -1, :].all()) and not bool(attention_mask[:, 0, 0, 1:].any()))
+            if Tq < min_query_len or not plain:
+                return cls.reference_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values, **kwargs)
+            ids = qsa_topk_block_ids(self.indexer, hidden_states, position_embeddings, past_key_values)
+            cos, sin = (x[:, -Tq:, :] for x in position_embeddings)
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.head_dim)
+            query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+            gate = gate.reshape(*input_shape, -1)
+            query_states = self.q_norm(query_states.view(hidden_shape)).transpose(1, 2)
+            key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            query_states, key_states = qm.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            if past_key_values is not None:
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+            attn_output = qsa_sparse_attention(query_states, key_states, value_states, ids, self.scaling,
+                                               r=self.indexer.compress_ratio)
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous() * torch.sigmoid(gate)
+            return self.o_proj(attn_output), None
+
+        cls.forward = sparse_forward
+        return True
+
+
+    return (use_sparse_attention,)
+
+
+@app.function(hide_code=True)
+def causal_conv1d_silu_btc(x, weight, bias=None):
+    """Depthwise causal conv1d + SiLU on the [B, T, C] layout: y[t] = silu(sum_j w[:, j] x[t - K + 1 + j] + bias),
+    fp32 accumulation. Same as the module's F.conv1d path on the [B, C, T] layout, without the transposes."""
+    K, T = weight.shape[-1], x.shape[1]
+    xf = F.pad(x, (0, 0, K - 1, 0)).float()
+    w = weight.float()
+    y = xf[:, 0:T] * w[:, 0]
+    for j in range(1, K):
+        y = y + xf[:, j : j + T] * w[:, j]
+    if bias is not None:
+        y = y + bias.float()
+    return F.silu(y).to(x.dtype)
+
+
+@app.function(hide_code=True)
+def use_fast_gdn(enabled=True):
+    """Gated DeltaNet without the layout copies of the reference forward: a compiled depthwise causal conv1d
+    + SiLU on the [B, T, C] layout, grouped value heads passed straight to the fla chunk kernel (16 q/k heads,
+    48 v heads, no repeat_interleave), and a compiled gated RMSNorm. Single-token decoding with a cache and
+    padded 2-D masks keep the reference forward. Needs use_fla_gdn(True). (The fla causal_conv1d kernel
+    autotunes again for every new sequence-length bucket, about 5 s each time, so it is not used.)"""
+    import torch._dynamo
+    gdn, norm = qm.Qwen4ExpTextGatedDeltaNet, qm.Qwen4ExpTextRMSNormGated
+    if "reference_forward" not in gdn.__dict__:
+        gdn.reference_forward = gdn.forward
+        norm.reference_forward = norm.forward
+    if not enabled:
+        gdn.forward = gdn.reference_forward
+        norm.forward = norm.reference_forward
+        return False
+    use_fla_gdn(True)
+    torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+    if "compiled_forward" not in norm.__dict__:
+        norm.compiled_forward = torch.compile(norm.reference_forward, dynamic=None)
+    norm.forward = norm.compiled_forward
+    if "conv_compiled" not in qm.__dict__:
+        qm.conv_compiled = torch.compile(causal_conv1d_silu_btc, dynamic=True)
+
+    def fast_forward(self, hidden_states, cache_params=None, attention_mask=None, **kwargs):
+        B, T, _ = hidden_states.shape
+        use_prev = cache_params is not None and cache_params.has_previous_state(self.layer_idx, state_idx=0)
+        if ((use_prev and T == 1) or (attention_mask is not None and not bool(attention_mask.all()))
+                or self.activation not in ("silu", "swish")):
+            return gdn.reference_forward(self, hidden_states, cache_params, attention_mask, **kwargs)
+        mixed_qkv = self.in_proj_qkv(hidden_states)
+        z = self.in_proj_z(hidden_states).reshape(B, T, -1, self.head_v_dim)
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
+        if cache_params is not None:
+            x = cache_params.update_conv_state(mixed_qkv.transpose(1, 2), self.layer_idx,
+                                               conv_kernel_size=self.conv_kernel_size).transpose(1, 2)
+        else:
+            x = mixed_qkv
+        x = qm.conv_compiled(x, self.conv1d.weight.squeeze(1), self.conv1d.bias)[:, -T:]
+        query, key, value = torch.split(x, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        query = query.reshape(B, T, -1, self.head_k_dim)
+        key = key.reshape(B, T, -1, self.head_k_dim)
+        value = value.reshape(B, T, -1, self.head_v_dim)
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_prev else None
+        out, last_state = qm.torch_chunk_gated_delta_rule(
+            query, key, value, g=g, beta=beta, initial_state=state, output_final_state=cache_params is not None,
+            use_qk_l2norm_in_kernel=True, cu_seqlens=kwargs.pop("cu_seq_lens_q", None))
+        if cache_params is not None:
+            cache_params.update_recurrent_state(last_state, self.layer_idx)
+        out = self.norm(out.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
+        return self.out_proj(out.reshape(B, T, -1))
+
+    gdn.forward = fast_forward
+    return True
+
+
+@app.function(hide_code=True)
+def hc_inject(hyper_input, h, w):
+    """Hyper-connection injection of a sublayer output: hyper_input + flatten(h[..., None, :] * w[..., None])."""
+    return hyper_input + (h.unsqueeze(-2) * w.unsqueeze(-1)).flatten(-2)
+
+
+@app.function(hide_code=True)
+def moe_combine(out_sorted, inv, weights, T, K):
+    """Weighted sum of the K expert outputs of each token; row t*K + k of the (token, slot) order sits at
+    out_sorted[inv[t*K + k]]. fp32 accumulation, output in out_sorted.dtype."""
+    x = out_sorted[inv].view(T, K, -1).float()
+    return (x * weights.float().unsqueeze(-1)).sum(1).to(out_sorted.dtype)
+
+
+@app.function(hide_code=True)
+def silu_mul(h, I):
+    """SwiGLU on the fused gate/up output: silu(h[:, :I]) * h[:, I:]."""
+    return F.silu(h[:, :I]) * h[:, I:]
+
+
+@app.function(hide_code=True)
+def use_fused_glue(enabled=True):
+    """torch.compile the elementwise glue around the big kernels: the hyper-connection injections of every
+    decoder layer (one fused kernel instead of a mul and an add on [T, 4 * 2560]), the MoE combine (gather +
+    weighted sum instead of index_put + bmm) and SwiGLU. enabled=False restores the reference code."""
+    import torch._dynamo
+    layer = qm.Qwen4ExpTextDecoderLayer
+    if "reference_forward" not in layer.__dict__:
+        layer.reference_forward = layer.forward
+    if not enabled:
+        layer.forward = layer.reference_forward
+        NVFP4Experts.combine_fn = None
+        NVFP4Experts.silu_mul_fn = None
+        return False
+    torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+    if "glue_compiled" not in qm.__dict__:
+        qm.glue_compiled = dict(inject=torch.compile(hc_inject, dynamic=True),
+                                combine=torch.compile(moe_combine, dynamic=True),
+                                silu_mul=torch.compile(silu_mul, dynamic=True))
+    NVFP4Experts.combine_fn = qm.glue_compiled["combine"]
+    NVFP4Experts.silu_mul_fn = qm.glue_compiled["silu_mul"]
+    inject = qm.glue_compiled["inject"]
+
+    def fast_forward(self, hidden_states, position_embeddings, attention_mask=None, conv_mask=None,
+                     past_key_values=None, ple_input_ids=None, **kwargs):
+        if self.ple is not None:
+            hidden_states = hidden_states + self.ple(hidden_states, ple_input_ids, past_key_values, conv_mask=conv_mask)
+        hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(hidden_states, cache_params=past_key_values, attention_mask=conv_mask, **kwargs)
+        else:
+            hidden_states, _ = self.self_attn(hidden_states, position_embeddings, attention_mask=attention_mask,
+                                              past_key_values=past_key_values, **kwargs)
+        hidden_states = inject(hyper_input, hidden_states, injection_weights)
+        hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return inject(hyper_input, hidden_states, injection_weights)
+
+    layer.forward = fast_forward
+    return True
+
+
 @app.cell
-def _(use_grouped_experts):
+def _(use_grouped_experts, use_sparse_attention):
     def use_fast_path(enabled=True):
-        """All speed switches at once: grouped NVFP4 experts, fla GDN kernels, vectorized indexer,
-        compiled hyper-connections, FlexAttention for long queries. enabled=False restores the reference path."""
+        """All speed switches at once: grouped NVFP4 experts, fla GDN kernels with the copy-free GDN forward,
+        vectorized indexer, compiled hyper-connections and elementwise glue, FlexAttention for long queries,
+        and the QSA sparse-attention kernel for long prefix passes. enabled=False restores the reference path."""
         use_grouped_experts(enabled)
         use_fla_gdn(enabled)
+        use_fast_gdn(enabled)
         use_fast_indexer(enabled)
         use_compiled_hyper_connections(enabled)
+        use_fused_glue(enabled)
         use_flex_attention(enabled)
+        use_sparse_attention(enabled)
         return enabled
+
 
     return (use_fast_path,)
 
 
-@app.function
-def start_pilot_job_fast(model, tokenizer, pilot_sets, out_dir="/root/models", tag="fast", questions_per_batch=2):
-    """Pilot in a background thread with the fast extraction: questions are processed in batches of
-    `questions_per_batch` (one batched prefix pass + one batched suffix pass per batch, the question
-    and the null question share the prefix). Results go to `<out_dir>/pilot_<tag>_nq_<regime>.pt`."""
-    import threading
-    import traceback
-    state = {"status": "running", "progress": "", "error": None, "t0": time.time(), "per_regime_s": {}}
-    for regime in pilot_sets:
-        path = os.path.join(out_dir, f"pilot_{tag}_nq_{regime}.pt")
-        if os.path.exists(path):
-            os.remove(path)
+@app.cell
+def start_pilot_job_fast(extract_teacher_multi):
+    def start_pilot_job_fast(model, tokenizer, pilot_sets, out_dir="/root/models", tag="fast", questions_per_batch=2):
+        """Pilot in a background thread with the fast extraction: questions are processed in batches of
+        `questions_per_batch` (one batched prefix pass + one batched suffix pass per batch, the question
+        and the null question share the prefix). Results go to `<out_dir>/pilot_<tag>_nq_<regime>.pt`."""
+        import threading
+        import traceback
+        state = {"status": "running", "progress": "", "error": None, "t0": time.time(), "per_regime_s": {}}
+        for regime in pilot_sets:
+            path = os.path.join(out_dir, f"pilot_{tag}_nq_{regime}.pt")
+            if os.path.exists(path):
+                os.remove(path)
 
-    def work():
-        try:
-            for regime, examples in pilot_sets.items():
-                t_reg = time.time()
-                recs = []
-                for b0 in range(0, len(examples), questions_per_batch):
-                    batch = examples[b0 : b0 + questions_per_batch]
-                    groups = [[build_rag_example(tokenizer, q, ex["passages"], ex["answer"]) for q in (ex["question"], "N/A")]
-                              for ex in batch]
-                    for ex, (sig_q, sig_null) in zip(batch, extract_teacher_multi(model, groups)):
-                        recs.append(dict(gold=ex["gold"], q=sig_q, null=sig_null))
-                    state["progress"] = f"{regime} {len(recs)}/{len(examples)} ({time.time() - state['t0']:.0f}s)"
-                torch.save(recs, os.path.join(out_dir, f"pilot_{tag}_nq_{regime}.pt"))
-                state["per_regime_s"][regime] = time.time() - t_reg
-            state["status"] = "finished"
-        except Exception:
-            state["status"] = "error"
-            state["error"] = traceback.format_exc()
+        def work():
+            try:
+                for regime, examples in pilot_sets.items():
+                    t_reg = time.time()
+                    recs = []
+                    for b0 in range(0, len(examples), questions_per_batch):
+                        batch = examples[b0 : b0 + questions_per_batch]
+                        groups = [[build_rag_example(tokenizer, q, ex["passages"], ex["answer"]) for q in (ex["question"], "N/A")]
+                                  for ex in batch]
+                        for ex, (sig_q, sig_null) in zip(batch, extract_teacher_multi(model, groups)):
+                            recs.append(dict(gold=ex["gold"], q=sig_q, null=sig_null))
+                        state["progress"] = f"{regime} {len(recs)}/{len(examples)} ({time.time() - state['t0']:.0f}s)"
+                    torch.save(recs, os.path.join(out_dir, f"pilot_{tag}_nq_{regime}.pt"))
+                    state["per_regime_s"][regime] = time.time() - t_reg
+                state["status"] = "finished"
+            except Exception:
+                state["status"] = "error"
+                state["error"] = traceback.format_exc()
 
-    state["thread"] = threading.Thread(target=work, name=f"qsa-pilot-{tag}", daemon=True)
-    state["thread"].start()
-    return state
+        state["thread"] = threading.Thread(target=work, name=f"qsa-pilot-{tag}", daemon=True)
+        state["thread"].start()
+        return state
+
+    return (start_pilot_job_fast,)
 
 
 @app.cell
@@ -1863,7 +2254,14 @@ def _():
 
 
 @app.cell
-def _(fast_pilot_button, model, pilot_sets, tokenizer, use_fast_path):
+def _(
+    fast_pilot_button,
+    model,
+    pilot_sets,
+    start_pilot_job_fast,
+    tokenizer,
+    use_fast_path,
+):
     mo.stop(not fast_pilot_button.value, mo.md("Press **Run fast pilot**. It runs in a background thread; results go to `/root/models/pilot_fast_nq_<regime>.pt`."))
     use_fast_path(True)
     fast_pilot_job = start_pilot_job_fast(model, tokenizer, pilot_sets, questions_per_batch=3)
@@ -1913,6 +2311,593 @@ def _():
     questions at layers 31 and 35, and cross-validated MRR / nDCG within 0.02 for every teacher except the native
     top-512 share at K = 64 (0.42 to 0.34; that teacher counts discrete block shares and flips on small score changes).
     """)
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    ## Phase 2b: standard rerank evaluation (pre-registered 4 Oct 2026, before any teacher pass on these sets)
+
+    **Question.** Can the QSA indexer of Qwen3.8-Flash-Next rerank BM25 candidates as well as the attention heads
+    (ICR, QRHead) and standard rerankers? The test sets are held out. The layer and the heads come from the NQ pilot.
+
+    **Data and first stage.**
+    - Datasets: TREC DL19 and DL20 passage (judged queries only, 43 and 54), and the BEIR test splits of TREC-COVID (50),
+      NFCorpus (323), SciFact (300) and FiQA (648). This gives 1,418 queries.
+    - First stage: Pyserini BM25 on the prebuilt flat indexes (k1 = 0.9, b = 0.4), top 100 (`phase2b_bm25.py`).
+    - Every reranker reads the same document: `title\ntext`, cut at 256 Qwen tokens (`text_trunc`).
+
+    **Teacher prompt.**
+    - Format: the chat prompt (non-thinking), the instruction, then the 100 documents as `[i] document`. Each
+      document is padded with newlines to a multiple of 4 tokens, so every document fills whole indexer blocks.
+      `Query: <query>` comes last.
+    - Document order: a fixed random permutation per query (seed = crc32 of `dataset/qid`), so position and BM25 rank are independent.
+    - Rows: the `Query: ...` tokens. Null calibration: the same prompt with the query `N/A`. Calibrated score = mass(query) − mass(null).
+
+    **Primary teacher (fixed).** Indexer, model layer 31 (the best layer on NQ K = 64), softmax over blocks of the
+    code-scale score s = I / sqrt(128) at temperature tau = 1. The chunk mass is summed over the document's blocks,
+    averaged over the query rows, then null-calibrated.
+
+    **Comparisons (all on the same candidates and the same truncated text).**
+    1. BM25 order.
+    2. QRHead-16: the sum of the calibrated dense attention masses of the 16 heads with the best NQ K = 64 question-row MRR
+       (`PHASE2B["top16_dense"]`).
+    3. ICR-288: the sum of the calibrated dense masses of all 288 heads in the 12 softmax-attention layers. The 36 Gated DeltaNet layers have no attention weights.
+    4. Supervised cross-encoders: `ms-marco-MiniLM-L-6-v2` and `bge-reranker-v2-m3`.
+    5. Dense retrievers used as rerankers: Contriever (unsupervised) and Revela-500M (this repository).
+    6. Random order (expected value) and the oracle order (the ceiling of the top-100 candidates).
+
+    **Metric and test.**
+    - Metric: nDCG@10 (trec_eval `ndcg_cut_10` through pytrec_eval, graded qrels, ideal DCG over all qrels).
+    - Test: paired bootstrap over queries (10,000 resamples, 95% percentile interval), per dataset and for the macro
+      mean over the 6 datasets (resampled within each dataset).
+
+    **Decision rules.**
+    - H1: the indexer is better than BM25 if the macro difference interval is above 0.
+    - H2 and H3 compare the indexer with QRHead-16 and with ICR-288.
+      - The indexer is "not worse" at a margin of 0.02 nDCG if the lower bound of the macro interval is above −0.02.
+      - The indexer is "worse" if the upper bound is below 0.
+
+    **Secondary analyses** (exploratory, labelled as such):
+    - all 12 layers;
+    - the temperature grid tau = 2^k / sqrt(128), k = 0..6, plus tau = 1. tau = 1/sqrt(128) is the paper-scale softmax(I) that the indexer was trained on. The pick is made leave-one-dataset-out;
+    - raw scores against calibrated scores;
+    - mean and max block score;
+    - the native top-512 share;
+    - sparse-attention heads;
+    - the z-scored mean of all layers;
+    - position profiles.
+
+    **Amendment (4 Oct 2026).** I made this amendment after the results of DL19, DL20 and 8 TREC-COVID queries were known. Speed is now the main goal, so:
+    - every pass stops after layer 35. The primary teacher and QRHead-16 need no later layer, and the forward pass is 25% faster. Without layers 39 to 47, ICR-288 (H3) is not computed;
+    - runs use tiers: smoke (DL19 + DL20), dev (+ TREC-COVID and 100 fixed random queries each of NFCorpus, SciFact and FiQA) and full (all 1,418 queries);
+    - one baseline (MiniLM) stays as a sanity check.
+
+    The primary teacher, H1, H2 and the tests do not change.
+    """)
+
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    PHASE2B = dict(
+        cand_dir="/root/models/phase2b",
+        datasets=["dl19", "dl20", "trec-covid", "nfcorpus", "scifact", "fiqa"],
+        k=100,
+        max_doc_tokens=256,
+        temps=sorted([2 ** k / math.sqrt(128) for k in range(7)] + [1.0]),
+        primary_temp=1.0,
+        primary_layer=31,
+        qsa_layers=[3 + 4 * i for i in range(12)],
+        # (model layer, head): the 16 best dense heads on NQ K = 64 question rows, null-calibrated (results/pilot_scores_k64.csv)
+        top16_dense=[(31, 12), (27, 2), (31, 2), (35, 13), (27, 19), (31, 5), (31, 3), (27, 3),
+                     (31, 15), (31, 16), (27, 0), (35, 2), (35, 12), (35, 10), (35, 18), (31, 14)],
+        n_boot=10000,
+        margin=0.02,
+        baselines=["ce-minilm"],  # one supervised reranker as a sanity check of the candidates and the eval code
+        last_layer=35,  # stop every pass after layer 35: the primary indexer (31) and the QRHead heads (27, 31, 35) need no later layer
+        # evaluation tiers: datasets and the fixed random subset size per dataset (None = all queries)
+        tiers={
+            "smoke": dict(datasets=["dl19", "dl20"], max_queries={}),
+            "dev": dict(datasets=["dl19", "dl20", "trec-covid", "nfcorpus", "scifact", "fiqa"],
+                        max_queries={"nfcorpus": 100, "scifact": 100, "fiqa": 100}),
+            "full": dict(datasets=["dl19", "dl20", "trec-covid", "nfcorpus", "scifact", "fiqa"], max_queries={}),
+        },
+    )
+
+    return (PHASE2B,)
+
+
+@app.function(hide_code=True)
+def build_rerank_example(tokenizer, query, docs, r=4):
+    """Chat-format rerank prompt (ICR-style context): instruction, numbered documents, then the query.
+
+    docs: list of document strings (already truncated). Each document chunk "[i] doc" is padded with
+    newlines to a multiple of r tokens (at least one newline), so chunk spans are block-aligned.
+    Returns ids [1, T], chunk spans, the query rows ("Query: ..." tokens) and empty answer rows."""
+    def enc(s):
+        return tokenizer(s, add_special_tokens=False).input_ids
+    nl = enc("\n")[0]
+    pre = enc("<|im_start|>user\nRead the documents, then find the documents that are relevant to the query.\n\n")
+    pre = pre + [nl] * (-len(pre) % r)
+    spans, body = [], []
+    for i, d in enumerate(docs):
+        c = enc(f"[{i + 1}] {d}")
+        c = c + [nl] * (1 + (-(len(c) + 1)) % r)
+        start = len(pre) + len(body)
+        spans.append((start, start + len(c)))
+        body += c
+    q = enc(f"Query: {query}")
+    mid = enc("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    ids = pre + body + q + mid
+    q0 = len(pre) + len(body)
+    return dict(ids=torch.tensor([ids]), spans=spans, q_rows=torch.arange(q0, q0 + len(q)),
+                a_rows=torch.arange(0))
+
+
+@app.function(hide_code=True)
+def segment_sum(w, seg, n):
+    """w [..., T]; seg [T] chunk index in 0..n (n = outside every chunk) -> [..., n] summed weight."""
+    out = torch.zeros(*w.shape[:-1], n + 1, dtype=torch.float32, device=w.device)
+    out.index_add_(w.dim() - 1, seg, w.float())
+    return out[..., :n]
+
+
+@app.function(hide_code=True)
+def rerank_signals_from_store(model, store, ex, temps):
+    """Chunk-level teacher signals for the query rows of a build_rerank_example prompt.
+
+    Returns CPU float tensors (L = 12 QSA layers, K = documents, H = 24 heads):
+      idx    [L, len(temps) + 2, K]: indexer softmax mass sum_{b in chunk} softmax(s / tau)_b, averaged
+                                     over query rows, for every tau in temps (s = code-scale score
+                                     I / sqrt(128); tau = 1/sqrt(128) is the paper-scale softmax(I)); then
+                                     the mean and the max block score in the chunk
+      sel    [L, K]:    share of the chunk's blocks inside the native top-512 selection
+      dense  [L, H, K]: dense attention mass per head; sparse: same under the indexer selection
+    """
+    device = model.lm_head.weight.device
+    spans = ex["spans"]
+    K = len(spans)
+    rows = ex["q_rows"].to(device)
+    T = int(ex["ids"].shape[1])
+    seg_tok = torch.full((T,), K, dtype=torch.long, device=device)
+    for k, (s, e) in enumerate(spans):
+        seg_tok[s:e] = k
+    out = {k: [] for k in ("idx", "sel", "dense", "sparse")}
+    for li in sorted(store):
+        x, (cos, sin) = store[li]
+        x, cos, sin = x[0], cos[0], sin[0]
+        attn = model.model.layers[li].self_attn
+        r = attn.indexer.compress_ratio
+        tok, sc, selb = indexer_selection_tokens(attn.indexer, x, cos, sin, rows)
+        full, valid = sc["score"], sc["valid"]
+        nb = full.shape[-1]
+        seg_blk = seg_tok[: nb * r : r]
+        masses = [segment_sum((full / t).softmax(-1), seg_blk, K).mean(0) for t in temps]
+        finite = full.masked_fill(~valid, 0.0)
+        cnt = segment_sum(valid.float(), seg_blk, K).clamp_min(1)
+        mean_sc = (segment_sum(finite, seg_blk, K) / cnt).mean(0)
+        max_sc = torch.stack([full[:, s // r : e // r].amax(-1) for s, e in spans], -1).mean(0)
+        out["idx"].append(torch.stack(masses + [mean_sc, max_sc]))
+        out["sel"].append((segment_sum(selb.float(), seg_blk, K) / cnt).mean(0))
+        de = attention_side_path(attn, x, cos, sin, rows, None)
+        out["dense"].append(segment_sum(de["probs"], seg_tok, K).mean(0))
+        del de
+        sp = attention_side_path(attn, x, cos, sin, rows, tok)
+        out["sparse"].append(segment_sum(sp["probs"], seg_tok, K).mean(0))
+        del sp
+    return {k: torch.stack(v).float().cpu() for k, v in out.items()}
+
+
+@app.function(hide_code=True)
+def rerank_doc_order(dataset, qid, n):
+    """Fixed random permutation of the n BM25 candidates for one query (seed = crc32 of 'dataset/qid')."""
+    import zlib
+    g = torch.Generator().manual_seed(zlib.crc32(f"{dataset}/{qid}".encode()))
+    return torch.randperm(n, generator=g).tolist()
+
+
+@app.function(hide_code=True)
+def phase2b_subset(dataset, qids, n=None):
+    """Fixed random subset of n query ids, sorted (all ids when n is None or n >= len(qids)); seed = crc32(dataset)."""
+    import zlib
+    qids = sorted(qids)
+    if n is None or n >= len(qids):
+        return qids
+    g = torch.Generator().manual_seed(zlib.crc32(dataset.encode()))
+    return sorted(qids[i] for i in torch.randperm(len(qids), generator=g)[:n].tolist())
+
+
+@app.cell(hide_code=True)
+def _(extract_teacher_multi):
+    def start_rerank_job(model, tokenizer, datasets, cand_dir, temps, out_dir=None, tag="qsa", last_layer=None, max_queries=None):
+        """Phase 2b teacher extraction in a background thread. For every query: the BM25 candidates in a fixed
+        random order, one prefix pass, then the query and the null query "N/A" as one suffix batch. Results go
+        to <out_dir>/teacher_<tag>_<dataset>.pt as {qid: dict(docids, q, null)}, saved every 25 queries so
+        the job can resume. A query without BM25 candidates gets docids = [] and q = null = None.
+        last_layer: stop the passes after this decoder layer (signals only for the QSA layers up to it).
+        max_queries: {dataset: n} runs only the fixed subset phase2b_subset(dataset, qids, n)."""
+        import threading, traceback
+        thread_name = f"qsa-rerank-{tag}"
+        if any(t.name == thread_name and t.is_alive() for t in threading.enumerate()):
+            raise RuntimeError(f"a {thread_name} job is already running; two jobs would share the GPU and the output files")
+        out_dir = out_dir or cand_dir
+        state = {"status": "running", "progress": "", "error": None, "t0": time.time(), "per_dataset_s": {}, "stop": False}
+
+        def work():
+            try:
+                for name in datasets:
+                    data = torch.load(os.path.join(cand_dir, f"candidates_{name}.pt"), weights_only=False)
+                    path = os.path.join(out_dir, f"teacher_{tag}_{name}.pt")
+                    recs = torch.load(path, weights_only=False) if os.path.exists(path) else {}
+                    t_ds = time.time()
+                    qids = phase2b_subset(name, data["queries"], (max_queries or {}).get(name))
+                    for n_done, qid in enumerate(qids):
+                        if state["stop"]:
+                            torch.save(recs, path)
+                            state["status"] = "stopped"
+                            return
+                        if qid in recs:
+                            continue
+                        cands = [d for d, _ in data["cands"][qid]]
+                        if not cands:
+                            recs[qid] = dict(docids=[], q=None, null=None, n_tokens=0)
+                            continue
+                        order = rerank_doc_order(name, qid, len(cands))
+                        docids = [cands[i] for i in order]
+                        texts = [data["docs"][d]["text_trunc"] for d in docids]
+                        group = [build_rerank_example(tokenizer, q, texts) for q in (data["queries"][qid], "N/A")]
+                        sig_q, sig_null = extract_teacher_multi(
+                            model, [group], signals_fn=lambda m, s, e: rerank_signals_from_store(m, s, e, temps), last_layer=last_layer)[0]
+                        recs[qid] = dict(docids=docids, q=sig_q, null=sig_null, n_tokens=int(group[0]["ids"].shape[1]))
+                        if len(recs) % 25 == 0:
+                            torch.save(recs, path)
+                        state["progress"] = f"{name} {n_done + 1}/{len(qids)} ({time.time() - state['t0']:.0f}s)"
+                    torch.save(recs, path)
+                    state["per_dataset_s"][name] = time.time() - t_ds
+                state["status"] = "finished"
+            except Exception:
+                state["status"] = "error"
+                state["error"] = traceback.format_exc()
+
+        state["thread"] = threading.Thread(target=work, name=thread_name, daemon=True)
+        state["thread"].start()
+        return state
+
+
+    return (start_rerank_job,)
+
+
+@app.function(hide_code=True)
+def trec_ndcg10(qrels, run):
+    """Per-query nDCG@10 with trec_eval semantics (pytrec_eval ndcg_cut_10). Queries of qrels that are
+    missing from run score 0."""
+    import pytrec_eval
+    ev = pytrec_eval.RelevanceEvaluator(qrels, {"ndcg_cut.10"})
+    res = ev.evaluate({q: {d: float(s) for d, s in run[q].items()} for q in qrels if q in run})
+    return {q: res[q]["ndcg_cut_10"] if q in res else 0.0 for q in qrels}
+
+
+@app.function(hide_code=True)
+def paired_bootstrap(diffs, n_boot=10000, seed=0):
+    """diffs: list of per-dataset 1-D tensors of per-query differences (system A - system B).
+    Resamples queries within each dataset; the statistic is the mean over datasets of the per-dataset
+    mean. Returns (point estimate, 2.5% quantile, 97.5% quantile)."""
+    g = torch.Generator().manual_seed(seed)
+    point = torch.stack([d.mean() for d in diffs]).mean().item()
+    boot = torch.zeros(n_boot)
+    for d in diffs:
+        idx = torch.randint(0, d.numel(), (n_boot, d.numel()), generator=g)
+        boot += d[idx].mean(1)
+    boot /= len(diffs)
+    lo, hi = torch.quantile(boot, torch.tensor([0.025, 0.975])).tolist()
+    return point, lo, hi
+
+
+@app.function(hide_code=True)
+def phase2b_teachers(cfg, n_layers=12):
+    """Teacher scorers for Phase 2b: name -> fn(sig_q, sig_null) -> scores [K].
+
+    The primary and the pre-registered comparison teachers come first. Index of a layer = position in cfg["qsa_layers"];
+    idx[:, j] = temperature j of cfg["temps"], then mean score (-2) and max score (-1).
+    n_layers: number of QSA layers in the records (9 when the passes stop after layer 35). A teacher is
+    built only when all of its layers are present (ICR-288 needs all 12)."""
+    L = cfg["qsa_layers"][:n_layers]
+    li = L.index(cfg["primary_layer"])
+    ti = cfg["temps"].index(cfg["primary_temp"])
+    heads = [(L.index(l), h) for l, h in cfg["top16_dense"]]
+    hl = torch.tensor([a for a, _ in heads])
+    hh = torch.tensor([b for _, b in heads])
+    t = {
+        "indexer_L31_t1_cal": lambda q, n: q["idx"][li, ti] - n["idx"][li, ti],
+        "qrhead16_cal": lambda q, n: (q["dense"][hl, hh] - n["dense"][hl, hh]).sum(0),
+        "indexer_L31_t1_raw": lambda q, n: q["idx"][li, ti],
+        "qrhead16_raw": lambda q, n: q["dense"][hl, hh].sum(0),
+        "qrhead16_sparse_cal": lambda q, n: (q["sparse"][hl, hh] - n["sparse"][hl, hh]).sum(0),
+    }
+    if n_layers == 12:
+        t["icr288_cal"] = lambda q, n: (q["dense"] - n["dense"]).sum((0, 1))
+        t["icr288_raw"] = lambda q, n: q["dense"].sum((0, 1))
+        t["icr288_sparse_cal"] = lambda q, n: (q["sparse"] - n["sparse"]).sum((0, 1))
+
+    def z(x):
+        return (x - x.mean(-1, keepdim=True)) / x.std(-1, keepdim=True).clamp_min(1e-12)
+
+    t["indexer_zmean_t1_cal"] = lambda q, n: z(q["idx"][:n_layers, ti] - n["idx"][:n_layers, ti]).mean(0)
+    for a, layer in enumerate(L):
+        for j, tau in enumerate(cfg["temps"]):
+            t[f"indexer_L{layer}_tau{tau:.3f}_cal"] = lambda q, n, a=a, j=j: q["idx"][a, j] - n["idx"][a, j]
+            t[f"indexer_L{layer}_tau{tau:.3f}_raw"] = lambda q, n, a=a, j=j: q["idx"][a, j]
+        t[f"indexer_L{layer}_meanscore_cal"] = lambda q, n, a=a: q["idx"][a, -2] - n["idx"][a, -2]
+        t[f"indexer_L{layer}_maxscore_cal"] = lambda q, n, a=a: q["idx"][a, -1] - n["idx"][a, -1]
+        t[f"native_sel_L{layer}"] = lambda q, n, a=a: q["sel"][a]
+        t[f"dense_layer_L{layer}_cal"] = lambda q, n, a=a: (q["dense"][a] - n["dense"][a]).sum(0)
+    return t
+
+
+@app.function(hide_code=True)
+def phase2b_evaluate(cfg, teacher_recs, tag="qsa"):
+    """Per-query nDCG@10 of every system on every dataset that has teacher records.
+
+    teacher_recs {dataset: {qid: dict(docids, q, null)}}. Returns (per_query {system: {dataset: tensor}},
+    qids {dataset: list}). Systems: bm25, random (mean of 20 permutations), oracle, the baselines that
+    have runs, and every teacher of phase2b_teachers. Only queries with teacher records are scored; a query
+    without candidates scores 0 for every system."""
+    n_layers = min(r["q"]["idx"].shape[0] for recs in teacher_recs.values() for r in recs.values() if r["q"] is not None)
+    teachers = phase2b_teachers(cfg, n_layers)
+    per_query, qids_by_ds = {}, {}
+    for ds, recs in teacher_recs.items():
+        data = torch.load(os.path.join(cfg["cand_dir"], f"candidates_{ds}.pt"), weights_only=False)
+        qids = sorted(q for q in data["queries"] if q in recs)
+        qids_by_ds[ds] = qids
+        qrels = {q: data["qrels"][q] for q in qids}
+
+        def add(name, run):
+            nd = trec_ndcg10(qrels, run)
+            per_query.setdefault(name, {})[ds] = torch.tensor([nd[q] for q in qids])
+
+        add("bm25", {q: {d: -i for i, (d, _) in enumerate(data["cands"][q])} for q in qids})
+        add("oracle", {q: {d: qrels[q].get(d, 0) - i / 1000 for i, (d, _) in enumerate(data["cands"][q])} for q in qids})
+        g = torch.Generator().manual_seed(0)
+        rand = []
+        for _ in range(20):
+            nd = trec_ndcg10(qrels, {q: {d: float(s) for (d, _), s in zip(data["cands"][q], torch.rand(len(data["cands"][q]), generator=g).tolist())}
+                                     for q in qids})
+            rand.append(torch.tensor([nd[q] for q in qids]))
+        per_query.setdefault("random", {})[ds] = torch.stack(rand).mean(0)
+        for b in cfg["baselines"]:
+            p = os.path.join(cfg["cand_dir"], f"run_{b}_{ds}.pt")
+            if os.path.exists(p):
+                add(b, torch.load(p, weights_only=False))
+        for name, fn in teachers.items():
+            add(name, {q: dict(zip(recs[q]["docids"], fn(recs[q]["q"], recs[q]["null"]).nan_to_num(0.0).tolist())) if recs[q]["docids"] else {}
+                       for q in qids})
+    return per_query, qids_by_ds
+
+
+@app.function(hide_code=True)
+def phase2b_report(cfg, per_query, primary="indexer_L31_t1_cal", against=None):
+    """(table, tests): table = nDCG@10 per system and dataset plus the macro mean; tests = paired
+    bootstrap of the primary teacher against the systems in `against` (default: the pre-registered
+    comparisons and the baselines), macro and per dataset."""
+    against = against or ["bm25", "qrhead16_cal", "icr288_cal", "random", "oracle"] + cfg["baselines"]
+    dss = [d for d in cfg["datasets"] if d in per_query["bm25"]]
+    rows = []
+    for name, by_ds in per_query.items():
+        if not all(d in by_ds for d in dss):
+            continue
+        r = {"system": name}
+        for d in dss:
+            r[d] = by_ds[d].mean().item()
+        r["macro"] = sum(r[d] for d in dss) / len(dss)
+        rows.append(r)
+    table = pl.DataFrame(rows).sort("macro", descending=True)
+    tests = []
+    for name, by_ds in per_query.items():
+        if name not in against or not all(d in by_ds for d in dss):
+            continue
+        diffs = [per_query[primary][d] - by_ds[d] for d in dss]
+        pt, lo, hi = paired_bootstrap(diffs, cfg["n_boot"])
+        r = dict(vs=name, delta_macro=pt, ci_lo=lo, ci_hi=hi)
+        for d, x in zip(dss, diffs):
+            p1, l1, h1 = paired_bootstrap([x], cfg["n_boot"])
+            r[f"{d}_delta"] = p1
+            r[f"{d}_lo"] = l1
+            r[f"{d}_hi"] = h1
+        tests.append(r)
+    return table, pl.DataFrame(tests).sort("delta_macro")
+
+
+@app.function(hide_code=True)
+def phase2b_lodo(cfg, per_query, family="indexer", kind="cal"):
+    """Leave-one-dataset-out choice of the indexer layer and temperature: for each dataset, pick the
+    (layer, tau) with the best mean nDCG@10 over the other datasets, then score it on the held-out one.
+    Returns (per_query tensors {dataset: tensor} of the LODO teacher, the picks)."""
+    dss = [d for d in cfg["datasets"] if d in per_query["bm25"]]
+    cands = [n for n in per_query if n.startswith(f"{family}_L") and "_tau" in n and n.endswith(kind)]
+    out, picks = {}, {}
+    for d in dss:
+        others = [o for o in dss if o != d]
+        best = max(cands, key=lambda n: sum(per_query[n][o].mean().item() for o in others) / len(others))
+        out[d] = per_query[best][d]
+        picks[d] = best
+    return out, picks
+
+
+@app.function(hide_code=True)
+def start_phase2b_first_stage(cfg, script_dir, out_dir="/root/models/phase2b", tokenizer_dir="/root/models/qwen38-nvfp4",
+                              java_home="/usr/lib/jvm/java-21-openjdk-amd64"):
+    """Run phase2b_bm25.py (BM25 candidates) and then phase2b_baselines.py (baseline runs) in a separate
+    process. Pyserini starts a JVM through pyjnius, so it stays out of the notebook kernel. Log:
+    <out_dir>/first_stage.log. Needs about 6 GB of free GPU memory for the baselines."""
+    import shlex, subprocess, sys
+    os.makedirs(out_dir, exist_ok=True)
+    py = shlex.quote(sys.executable)
+    ds = " ".join(cfg["datasets"])
+    cmd = (f"{py} {shlex.quote(os.path.join(script_dir, 'phase2b_bm25.py'))} --out {out_dir} --tokenizer {tokenizer_dir} "
+           f"--k {cfg['k']} --max_doc_tokens {cfg['max_doc_tokens']} --datasets {ds} && "
+           f"{py} {shlex.quote(os.path.join(script_dir, 'phase2b_baselines.py'))} --dir {out_dir} --datasets {ds}")
+    env = dict(os.environ, JAVA_HOME=java_home)
+    return subprocess.Popen(cmd, shell=True, env=env, stdout=open(os.path.join(out_dir, "first_stage.log"), "w"),
+                            stderr=subprocess.STDOUT, start_new_session=True)
+
+
+@app.cell(hide_code=True)
+def _():
+    stage1_button = mo.ui.run_button(label="Build BM25 candidates and baseline runs (separate process)")
+    stage1_button
+
+    return (stage1_button,)
+
+
+@app.cell(hide_code=True)
+def _(PHASE2B, stage1_button):
+    mo.stop(not stage1_button.value, mo.md("Press the button to build the candidates. `phase2b_bm25.py` and `phase2b_baselines.py` must be in `PHASE2B['cand_dir']` (they are next to this notebook in the repository)."))
+    stage1_proc = start_phase2b_first_stage(PHASE2B, PHASE2B["cand_dir"])
+    mo.md(f"First stage started (pid {stage1_proc.pid}); log: `{PHASE2B['cand_dir']}/first_stage.log`.")
+
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    rerank_tier = mo.ui.dropdown(options=["smoke", "dev", "full"], value="dev", label="Tier")
+    rerank_button = mo.ui.run_button(label="Run Phase 2b teacher job (background thread)")
+    mo.hstack([rerank_tier, rerank_button], justify="start")
+
+    return rerank_button, rerank_tier
+
+
+@app.cell(hide_code=True)
+def _(
+    PHASE2B,
+    model,
+    rerank_button,
+    rerank_tier,
+    start_rerank_job,
+    tokenizer,
+    use_fast_path,
+):
+    mo.stop(not rerank_button.value, mo.md("Choose a tier and press **Run Phase 2b teacher job**. smoke: DL19 + DL20 (97 queries, about 3 min). "
+                                          "dev: + TREC-COVID and 100 fixed random queries of NFCorpus, SciFact and FiQA (447 queries, about 20 min). "
+                                          "full: all 1,418 queries. The job saves `teacher_qsa_<dataset>.pt` every 25 queries and skips queries it already has."))
+    use_fast_path(True)
+    _tier = PHASE2B["tiers"][rerank_tier.value]
+    rerank_job = start_rerank_job(model, tokenizer, _tier["datasets"], PHASE2B["cand_dir"], PHASE2B["temps"],
+                                  last_layer=PHASE2B["last_layer"], max_queries=_tier["max_queries"])
+    mo.md(f"Phase 2b teacher job started (tier **{rerank_tier.value}**). Use **Refresh** below to see the progress and the results so far.")
+
+    return
+
+
+@app.cell(hide_code=True)
+def _():
+    p2b_refresh = mo.ui.run_button(label="Refresh Phase 2b results")
+    p2b_refresh
+
+    return (p2b_refresh,)
+
+
+@app.cell(hide_code=True)
+def _(PHASE2B, p2b_refresh):
+    p2b_refresh
+    _job = globals().get("rerank_job")
+    p2b_recs = {}
+    for _d in PHASE2B["datasets"]:
+        _p = os.path.join(PHASE2B["cand_dir"], f"teacher_qsa_{_d}.pt")
+        if os.path.exists(_p):
+            p2b_recs[_d] = torch.load(_p, weights_only=False)
+    mo.stop(not p2b_recs, mo.md("No Phase 2b teacher records yet."))
+    p2b_per_query, p2b_qids = phase2b_evaluate(PHASE2B, p2b_recs)
+    _lodo, p2b_lodo_picks = phase2b_lodo(PHASE2B, p2b_per_query)
+    p2b_per_query["indexer_lodo_layer_tau_cal"] = _lodo
+    p2b_table, p2b_tests = phase2b_report(PHASE2B, p2b_per_query,
+                                          against=["bm25", "qrhead16_cal", "icr288_cal", "random", "oracle", "indexer_lodo_layer_tau_cal"] + PHASE2B["baselines"])
+    _main = ["oracle", "ce-minilm", "icr288_cal", "qrhead16_cal",
+             "indexer_L31_t1_cal", "indexer_lodo_layer_tau_cal", "indexer_zmean_t1_cal", "indexer_L31_t1_raw",
+             "qrhead16_raw", "icr288_raw", "qrhead16_sparse_cal", "icr288_sparse_cal", "bm25", "random"]
+    _n = {d: len(q) for d, q in p2b_qids.items()}
+    mo.vstack([
+        mo.md(f"Teacher job: **{_job['status'] if _job else 'not started in this session'}** {_job['progress'] if _job else ''}. "
+              f"Queries with teacher records: {_n}"),
+        mo.md("**nDCG@10, main systems** (only the queries with teacher records)"),
+        mo.ui.table(p2b_table.filter(pl.col("system").is_in(_main)).with_columns(pl.exclude("system").round(4)), selection=None, page_size=20),
+        mo.md("**Primary teacher (indexer, layer 31, tau = 1, calibrated) minus each system**: macro mean and 95% paired bootstrap interval"),
+        mo.ui.table(p2b_tests.with_columns(pl.exclude("vs").round(4)), selection=None, page_size=20),
+        mo.md(f"Leave-one-dataset-out picks: {p2b_lodo_picks}"),
+    ])
+
+    return p2b_per_query, p2b_recs
+
+
+@app.cell(hide_code=True)
+def _(PHASE2B, p2b_per_query):
+    _rows = []
+    for _l in PHASE2B["qsa_layers"]:
+        for _t in PHASE2B["temps"]:
+            for _kind in ("cal", "raw"):
+                _name = f"indexer_L{_l}_tau{_t:.3f}_{_kind}"
+                if _name in p2b_per_query:
+                    _rows.append(dict(layer=_l, tau=round(_t, 3), kind=_kind,
+                                      macro=sum(v.mean().item() for v in p2b_per_query[_name].values()) / len(p2b_per_query[_name])))
+    _df = pl.DataFrame(_rows)
+    mo.vstack([
+        mo.md("**Indexer, every layer and temperature: macro nDCG@10 (exploratory)**"),
+        alt.Chart(_df).mark_line(point=True).encode(
+            x=alt.X("layer:O"), y=alt.Y("macro:Q", scale=alt.Scale(zero=False)), color="tau:N", strokeDash="kind:N"
+        ).properties(width=620, height=300),
+    ])
+
+    return
+
+
+@app.function(hide_code=True)
+def phase2b_bias_report(cfg, teacher_recs, min_docs=10):
+    """Exploratory bias check. For every query with at least min_docs candidates, the Spearman correlation of
+    the teacher score with the document slot (position in the prompt) and with the document length in
+    tokens, over the non-relevant candidates only (grade <= 0 or not judged). Slot is random, so any slot
+    correlation is pure position bias. Returns the mean correlation per dataset and teacher."""
+    n_layers = min(r["q"]["idx"].shape[0] for recs in teacher_recs.values() for r in recs.values() if r["q"] is not None)
+    teachers = phase2b_teachers(cfg, n_layers)
+    names = [n for n in ["indexer_L31_t1_raw", "indexer_L31_t1_cal", "qrhead16_raw", "qrhead16_cal", "icr288_raw", "icr288_cal"] if n in teachers]
+
+    def spearman(a, b):
+        ra, rb = a.argsort().argsort().float(), b.argsort().argsort().float()
+        ra, rb = ra - ra.mean(), rb - rb.mean()
+        return (ra @ rb / (ra.norm() * rb.norm()).clamp_min(1e-12)).item()
+
+    rows = []
+    for ds, recs in teacher_recs.items():
+        data = torch.load(os.path.join(cfg["cand_dir"], f"candidates_{ds}.pt"), weights_only=False)
+        for n in names:
+            rho_slot, rho_len = [], []
+            for q, r in recs.items():
+                if len(r["docids"]) < min_docs:
+                    continue
+                keep = torch.tensor([data["qrels"][q].get(d, 0) <= 0 for d in r["docids"]])
+                if int(keep.sum()) < min_docs:
+                    continue
+                sc = teachers[n](r["q"], r["null"])[keep]
+                slot = torch.arange(len(r["docids"]), dtype=torch.float32)[keep]
+                ln = torch.tensor([len(data["docs"][d]["ids"]) for d in r["docids"]], dtype=torch.float32)[keep]
+                rho_slot.append(spearman(sc, slot))
+                rho_len.append(spearman(sc, ln))
+            rows.append(dict(dataset=ds, teacher=n, queries=len(rho_slot),
+                             rho_slot=sum(rho_slot) / max(1, len(rho_slot)), rho_len=sum(rho_len) / max(1, len(rho_len))))
+    return pl.DataFrame(rows)
+
+
+@app.cell(hide_code=True)
+def _(PHASE2B, p2b_recs):
+    p2b_bias = phase2b_bias_report(PHASE2B, p2b_recs)
+    mo.vstack([
+        mo.md("**Bias check (exploratory)**: mean per-query Spearman correlation of the score with the document slot and with the "
+              "document length, on non-relevant candidates. The slot is random, so a slot correlation is position bias."),
+        mo.ui.table(p2b_bias.with_columns(pl.col("rho_slot", "rho_len").round(3)), selection=None, page_size=40),
+    ])
+
     return
 
 

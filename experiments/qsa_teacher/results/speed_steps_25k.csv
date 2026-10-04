@@ -1,0 +1,6 @@
+step,seconds_per_query,tokens,notes
+fast path of the NQ pilot (all 48 layers; FlexAttention; reference GDN),5.9,25700,SciFact query + null query; prefix pass 5.2 s
++ early exit after layer 35,4.4,25700,signals for layers <= 35 identical (max diff 2e-6)
++ QSA sparse-attention kernel (no T x T masks),3.6,24600,logits KL 0.011 vs FlexAttention; teacher Spearman >= 0.994
++ copy-free GDN (GVA fla kernel; compiled conv1d and gated norm),3.1,24600,logits KL 0.013; teacher Spearman >= 0.995
++ compiled hyper-connection injection and MoE combine,2.95,24900,logits KL 0.012; teacher Spearman >= 0.987

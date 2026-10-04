@@ -14,7 +14,8 @@ Revela-style dense retriever.
 | QSA scorer | `qsa_index_parts`, `qsa_block_scores` and `qsa_select_blocks` compute the indexer scores for all rows at once. `qsa_block_scores` can also return the dot products split into the RoPE part (dims 0 to 63) and the position-free part (dims 64 to 127). `fast_indexer_forward` replaces the per-query Python loop in `Qwen4ExpTextQSAIndexer.forward`. It works with and without a KV cache, and it falls back to the reference code when the mask has padding. |
 | Attention side path | `attention_side_path` recomputes any QSA layer for chosen query rows: dense or sparse probabilities for all 24 heads, head outputs, and the elementwise sigmoid output gate. `indexer_selection_tokens` gives the token-level top-512 selection. |
 | Phase 2 pilot | `build_rag_example` (chat format, non-thinking, passages padded or cut to exactly 160 tokens = 40 blocks), `extract_teacher_signals` (chunk-level teacher signals per layer and head), `start_pilot_job` (runs in a background thread), `pilot_score_table` and `pilot_cv_report` (gold-rank metrics; every head and layer choice is made on the other half of the questions). |
-| Speed path | `nvfp4_dequant_kernel` (Triton), `grouped_experts_forward`, `use_fla_gdn`, `use_compiled_hyper_connections`, `use_flex_attention`, `use_fast_path`, `extract_teacher_batch` and `extract_teacher_multi` (batched prefix and suffix passes on an expanded KV cache), `start_pilot_job_fast`. |
+| Speed path | `nvfp4_dequant_kernel` (Triton), `grouped_experts_forward`, `use_fla_gdn`, `use_fast_gdn`, `use_compiled_hyper_connections`, `use_fused_glue`, `use_flex_attention` (block mask from `bool_mask_to_block_mask`), `use_sparse_attention` (Triton `qsa_sparse_attn_kernel` over `qsa_topk_block_ids`), `run_until` (early exit after a chosen layer), `use_fast_path`, `extract_teacher_batch` and `extract_teacher_multi` (batched prefix and suffix passes on an expanded KV cache), `start_pilot_job_fast`. |
+| Phase 2b rerank eval | Pre-registration cell and `PHASE2B` config, `phase2b_bm25.py` and `phase2b_baselines.py` (separate processes), `build_rerank_example`, `rerank_signals_from_store` (temperature sweep), `start_rerank_job` (tiers smoke / dev / full), `phase2b_evaluate`, `phase2b_report`, `phase2b_lodo`, `phase2b_bias_report`. |
 | Tests | `nvfp4_unit_tests` and `tiny_parity` (random-weight model with the real attention geometry), `indexer_parity` and `selection_tie_stats` (real model), the side-path check against the module output, and `profile_forward`. |
 
 ## Phase 1 results: loader and scorer (4 Oct 2026)
@@ -65,10 +66,46 @@ The pilot extraction (`extract_teacher_multi`) adds three more savings:
   - every cross-validated MRR and nDCG is within 0.02, except the native top-512 share at K = 64 (0.42 → 0.34);
   - the indexer-vs-dense conclusion does not change.
 
+### Speed path, part 2: long rerank prompts (25K tokens)
+
+The rerank prompts of Phase 2b have 100 documents, about 25K tokens. At this length the pilot fast path took 5.9 s per query (query + null query). A profile showed these costs:
+- the per-expert matmul loop that `torch._grouped_mm` runs on this GPU (sm_120);
+- FlexAttention. The indexer picks 4-token blocks separately for each row, so nearly every 128 x 128 tile is partial, and the kernel does close to dense causal work;
+- dense 25K x 25K boolean masks (650 MB each), built and combined several times per QSA layer;
+- the layout copies of the Gated DeltaNet forward.
+
+| Step (`results/speed_steps_25k.csv`) | s per query | Parity with the step before |
+|---|---:|---|
+| Pilot fast path, all 48 layers | 5.9 | |
+| `run_until(..., last_layer=35)`: stop after layer 35. The layer-31 indexer and the QRHead heads (layers 27, 31, 35) need no later layer | 4.4 | signals of layers 3 to 35 identical (max difference 2e-6) |
+| `use_sparse_attention`: the indexer returns its top-512 block ids, and a Triton kernel attends to the selected blocks and the tail tokens. One program per (row, KV head), with the 12 query heads of the KV head as the matmul rows. No T x T mask exists | 3.6 | kernel against masked SDPA: 0.2% relative error. Logits KL 0.011 against FlexAttention, teacher Spearman 0.994 or higher |
+| `use_fast_gdn`: grouped value heads go straight to the fla chunk kernel (no `repeat_interleave`), a compiled 4-tap causal conv1d + SiLU on the [B, T, C] layout, and a compiled gated RMSNorm | 3.1 | logits KL 0.013, teacher Spearman 0.995 or higher |
+| `use_fused_glue`: compiled hyper-connection injection, MoE combine (gather + weighted sum) and SwiGLU | 2.95 | logits KL 0.012, teacher Spearman 0.987 or higher |
+
+**End to end on the smoke tier.** DL19 + DL20 (97 queries) took 157 s on the current fast path. Against the records of the pilot fast path (all layers, FlexAttention):
+- primary nDCG@10: 0.608 → 0.603 (DL19) and 0.566 → 0.568 (DL20);
+- QRHead-16: 0.635 → 0.638 and 0.590 → 0.592;
+- per-query Spearman of the calibrated layer-31 scores: mean 0.993, minimum 0.972.
+
+**Total drift of the fast path.** Reference path against the full fast path, WikiText 10,240 tokens, all 48 layers: logits KL 0.013, top-1 agreement 96.6%, NLL 1.121 (reference) and 1.112 (fast). The rounding differences of the separate steps do not add up. A 10,240-token forward takes 6.55 s on the reference path and 1.80 s on the fast path.
+
+**Notes.**
+- The cached continuation differs from one full pass by about 12% relative error in the last hidden states (logits KL about 0.02). The reference path shows the same, so this is bf16 noise and not a cache bug.
+- The fla `causal_conv1d` kernel autotunes again for each new sequence-length bucket (about 5 s each time). It is not used.
+- The remaining costs at 25K tokens, layers up to 35:
+  - the per-expert matmul loop: about 0.4 s;
+  - the NVFP4 decode into bf16: 0.2 s;
+  - the sparse attention kernel: 0.2 s;
+  - the dense projections: about 0.4 s.
+
+  A grouped GEMM with the NVFP4 decode fused in, or FP4 tensor cores (W4A4, as vLLM does), would cut most of the first two.
+
 Lessons for long runs on molab:
-- Run long jobs in a background thread (`start_pilot_job*`). When an HTTP request to the kernel is cancelled, marimo interrupts the running cell.
+- Run long jobs in a background thread (`start_pilot_job*`, `start_rerank_job`). When an HTTP request to the kernel is cancelled, marimo interrupts the running cell.
+- `set_ui_value` on a run button already runs the cell. A second explicit `run_cell` runs it again and starts a second job. `start_rerank_job` now refuses to start while a job thread with the same name is alive.
 - In scratchpad code, keep large tensors inside functions, because loop variables and failed calls can keep GPU memory alive.
 - Do not give Triton kernels names that start with `_`. marimo renames such names, and Triton then cannot find the function.
+- `pyserini` 2.4 installs torch 2.14, numpy 2.5 and a CUDA 13 stack. In the molab venv these shadowed the system torch 2.11. Run pyserini in a separate process (`phase2b_bm25.py`, with `JAVA_HOME` set), and remove the extra torch, triton, numpy, `nvidia-*` and `cuda-*` packages from the venv after the install.
 
 ## Phase 2 pilot: does the indexer point at the gold passage?
 
@@ -102,6 +139,65 @@ Other findings:
 - **Output-gate weighting** does not change the ranks at the chunk level.
 - **Caveats.** These are small samples (96 and 64 questions). The layer choice is cross-validated, but the variants were explored on the same data. About 20% of passages were cut at 159 tokens. The loader runs W4A16, while vLLM serves this checkpoint as W4A4.
 
+## Phase 2b: standard rerank evaluation (BM25 top 100, nDCG@10)
+
+**Design.** The full pre-registration is in the notebook cell "Phase 2b".
+- **Data.** TREC DL19 and DL20 passage, and the BEIR test sets of TREC-COVID, NFCorpus, SciFact and FiQA.
+- **First stage.** Pyserini BM25 flat, top 100. Every system reads the same documents, cut at 256 Qwen tokens.
+- **Teacher prompt.** The documents in a fixed random order per query, then `Query: ...`. The signals are read on the query tokens and calibrated against the null query `N/A`.
+- **Primary teacher.** The layer-31 indexer, code-scale softmax at tau = 1, block mass summed per document, null-calibrated. The layer and the 16 QRHead heads come from the NQ K = 64 pilot, so these test sets are held out.
+- **Metric and test.** nDCG@10 with trec_eval semantics (pytrec_eval). Paired bootstrap over queries, macro mean over datasets.
+
+**Amendment, made after DL19, DL20 and 8 TREC-COVID queries were known.** Speed is now the main goal, so:
+- all passes stop after layer 35;
+- ICR-288 (all 288 heads) is not computed;
+- one baseline (MiniLM) stays as a sanity check;
+- runs use tiers: smoke (DL19 + DL20, 97 queries), dev (+ TREC-COVID and 100 fixed random queries each of NFCorpus, SciFact and FiQA, 447 queries) and full (1,418 queries).
+
+**Sanity check of the eval.**
+- BM25 reproduces the Pyserini regression values on the full sets: DL19 0.5058, DL20 0.4796, TREC-COVID 0.5947, NFCorpus 0.3218, SciFact 0.6789.
+- MiniLM-L6 reproduces the BEIR-paper reranking numbers to within about 0.016: TREC-COVID 0.741, NFCorpus 0.350, SciFact 0.682.
+
+**Dev-tier results** (447 queries; `results/phase2b_dev_*.csv`; nDCG@10):
+
+| System | DL19 | DL20 | TREC-COVID | NFCorpus | SciFact | FiQA | Macro |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Oracle order of the top 100 (ceiling) | 0.892 | 0.871 | 0.975 | 0.543 | 0.949 | 0.635 | 0.811 |
+| QRHead-16, calibrated | 0.635 | 0.590 | 0.770 | 0.354 | 0.790 | 0.498 | **0.606** |
+| MiniLM-L6 cross-encoder (supervised on MS MARCO) | 0.727 | 0.675 | 0.741 | 0.346 | 0.683 | 0.403 | 0.596 |
+| **Indexer L31, tau = 1, calibrated (primary)** | 0.608 | 0.566 | 0.749 | 0.348 | 0.791 | 0.479 | **0.590** |
+| Indexer, layer and tau chosen leave-one-dataset-out | 0.608 | 0.578 | 0.744 | 0.353 | 0.776 | 0.469 | 0.588 |
+| Indexer, z-scored mean of layers 3 to 35 | 0.569 | 0.520 | 0.749 | 0.346 | 0.770 | 0.449 | 0.567 |
+| QRHead-16, raw | 0.469 | 0.455 | 0.679 | 0.328 | 0.784 | 0.484 | 0.533 |
+| Indexer L31, raw | 0.420 | 0.370 | 0.650 | 0.300 | 0.784 | 0.459 | 0.497 |
+| BM25 | 0.506 | 0.480 | 0.595 | 0.320 | 0.690 | 0.293 | 0.480 |
+| Random order (mean of 20) | 0.215 | 0.160 | 0.400 | 0.161 | 0.051 | 0.038 | 0.171 |
+
+The rows below are the paired bootstrap of the primary teacher minus each system, macro mean, with 95% intervals:
+- **H1, against BM25:** +0.110 [+0.087, +0.133]. It is better on every set. The NFCorpus interval touches 0: +0.028 [−0.001, +0.058].
+- **H2, against QRHead-16:** −0.016 [−0.023, −0.009]. By the pre-registered rule the indexer is "worse", because the upper bound is below 0. The lower bound is just outside the 0.02 margin. Per set, the difference is −0.028 (DL19), −0.023 (DL20), −0.021 (TREC-COVID), −0.019 (FiQA), and −0.007 and +0.001 on NFCorpus and SciFact.
+- **Against MiniLM:** −0.006 [−0.024, +0.013]. The indexer is worse on DL19 and DL20, which are in the MiniLM training domain (−0.12 and −0.11). It is better on SciFact (+0.108) and FiQA (+0.076).
+- **Against the leave-one-dataset-out pick:** +0.002 [−0.003, +0.007]. Layer 31 wins on every held-out split. tau = 1.414 wins 5 of 6, but this gains only about 0.004.
+
+**Bias check** (`results/phase2b_dev_bias.csv`). This is the Spearman correlation on non-relevant documents. The slot is random, so a slot correlation is pure position bias.
+- **Raw indexer scores** favour early slots (rho −0.24 to −0.31) and long documents (rho up to +0.41 on DL).
+- **After null calibration:** |rho_slot| ≤ 0.11 and |rho_len| ≤ 0.10.
+- **Calibrated QRHead-16** over-corrects on SciFact (rho_slot +0.23).
+
+**What this says.**
+- The indexer alone, one layer and no head choice, is a zero-shot reranker on par with a supervised MiniLM cross-encoder outside MS MARCO. It is 0.016 nDCG behind the best 16 attention heads.
+- As a teacher, the indexer has two practical gains: its signal is one distribution per row that the model already computes, and it was trained with a KL loss to be a ranking distribution.
+- It is not a better signal than the heads.
+
+**Caveats.**
+- The dev tier is a subset, so the full tier is still to run.
+- The amendment came after a small look at the data.
+- The records come from three versions of the fast path: DL from full depth with FlexAttention, the rest from exit at 35. The teacher Spearman between paths is 0.99 or higher.
+- ICR-288 is not in the comparison.
+- One prompt template, not tuned.
+- Documents are cut at 256 tokens.
+- The model runs W4A16, while vLLM serves this checkpoint as W4A4.
+
 ## Corrections to the earlier plan
 
 - The tech report's residual-path analysis is about the gated-residual streams of a 20-layer probe model. It does not show that the softmax-attention layers are the main long-range readers.
@@ -115,5 +211,9 @@ Other findings:
 2. Download the checkpoint, about 133 GB: `hf download nvidia/Qwen3.8-Flash-Next-NVFP4 --local-dir /root/models/qwen38-nvfp4`
 3. Run the cells, then press **Load**. The load takes about 75 s from a local disk.
 4. Press **Run pilot**. It runs in a background thread for about 30 minutes, so a dropped browser or HTTP request cannot interrupt it. Then run the loader cell below it.
+5. Phase 2b:
+   - Copy `phase2b_bm25.py` and `phase2b_baselines.py` to `PHASE2B["cand_dir"]` and press **Build BM25 candidates and baseline runs**. This needs pyserini and Java 21, takes about 5 minutes, and runs in its own process.
+   - Choose a tier and press **Run Phase 2b teacher job**. On the current fast path the smoke tier took 157 s (measured, 97 queries). For the dev tier I estimate about 17 minutes, based on 2.95 s per 25K-token query (not measured end to end). Records that already exist are skipped.
+   - Press **Refresh Phase 2b results**.
 
-Requirements: `transformers==5.18.0` (it has `qwen4_exp`), `torch>=2.11` with CUDA (Triton 3.6), `flash-linear-attention==0.5.2`, `safetensors`, `datasets`, and `polars`.
+Requirements: `transformers==5.18.0` (it has `qwen4_exp`), `torch>=2.11` with CUDA (Triton 3.6), `flash-linear-attention==0.5.2`, `safetensors`, `datasets`, `polars`, and `pytrec-eval-terrier`. For the Phase 2b first stage: `pyserini==2.4.0` with a Java 21 JRE (`JAVA_HOME`) in the environment that runs `phase2b_bm25.py`. See the pyserini note under "Lessons" before you install it next to the notebook.
