@@ -1,0 +1,6 @@
+subset,queries,ndcg_cut_10,ndcg_cut_50,recall_1,recall_10,recall_50,recall_100,ndcg10_lo,ndcg10_hi,gold_rank_median,gold_rank_p90,gold_rank_max,gold_rank_gt10
+all,254,0.9066,0.9129,0.8661,0.9449,0.9724,0.9843,0.8735,0.9367,1,3,258,14
+first half (fixed random),127,0.8764,0.8785,0.811,0.937,0.9449,0.9685,0.8257,0.9235,1,4,258,8
+second half,127,0.9367,0.9473,0.9213,0.9528,1.0,1.0,0.8953,0.973,1,1,44,6
+gold found by first stage,32,1.0,,1.0,1.0,,,,,,,,
+gold injected,222,0.8931,,0.8468,0.9369,,,,,,,,

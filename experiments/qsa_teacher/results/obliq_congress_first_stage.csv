@@ -1,0 +1,3 @@
+retriever,docs,queries,doc_max_tokens,ndcg@10,r@10,r@50,r@100
+Qwen3-Embedding-0.6B,213650,254,512,0.0052,0.0079,0.0276,0.0394
+linkup-sparseup-embed-v1,213650,254,512,0.0325,0.0472,0.0866,0.1102

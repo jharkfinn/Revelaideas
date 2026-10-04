@@ -261,7 +261,7 @@ Our 0.590 comes from a softmax that is 11× flatter.
 
 This pool removes the topic shortcut. The golds are concentrated (60 of 1,304 hearings hold all of them, and 10 tech hearings hold 55%), so the test is whether a system can find the exchange inside its hearing.
 
-The pool differs from the paper's, which uses about 300 dense neighbors from many hearings with the gold injected. So the paper's GPT-5.2 tournament score (0.913 NDCG@10) is context only, not a direct comparison.
+The pool differs from the paper's, which uses about 300 dense neighbors from many hearings with the gold injected. So the paper's GPT-5.2 tournament score (0.913 NDCG@10) is context only, not a direct comparison. Part 2 below copies the paper's pool format.
 
 **Results** (`results/obliq_congress_*.csv`, 254 queries):
 
@@ -300,6 +300,61 @@ So the signals match the query to its exchange. They do not pick dramatic passag
 
   Deeper layers also do better here (35 > 31 > 27).
 
+## OBLIQ-Bench Congress, part 2: the paper's pool format (300 candidates)
+
+**The set-up.** This copies the paper's oracle set-up (Sec. 5 and footnote 3). For each query, first-stage retrievers fetch their top results from the full corpus, and the gold is put in when they miss it. Then the teacher ranks the pool. The paper's ranker is a GPT-5.2 listwise tournament. Ours is query likelihood (UPR) from Qwen3.8-Flash-Next, with one passage in context:
+
+s(q, d) = (1 / |q|) · Σ_{i=1}^{|q|} log p_θ(q_i | prompt(d), q_1, …, q_{i−1})
+
+where:
+- d is the passage;
+- q_i is query token i and |q| is the number of query tokens;
+- prompt(d) is "Document: d … Write a search query for this document." in chat format, with an empty think block;
+- p_θ is the next-token probability of the model.
+
+**First stage** on the full corpus (213,650 passages, 254 queries; `obliq_embed.py`, `obliq_sparse.py`, `results/obliq_congress_first_stage.csv`):
+
+| Retriever | NDCG@10 | R@10 | R@50 | R@100 | Paper, NDCG@10 / R@100 |
+|---|---:|---:|---:|---:|---:|
+| Qwen3-Embed-0.6B, passages cut at 512 tokens | 0.005 | 0.008 | 0.028 | 0.039 | .006 / .055 |
+| SPARSEUP (`linkup-sparseup-embed-v1`, 149M, learned sparse) | 0.033 | 0.047 | 0.087 | 0.110 | not in the paper |
+
+Our Qwen3-Embed-0.6B is near the paper's number. Its R@100 is lower (0.039 against .055); the 512-token passage cut is one possible cause. SPARSEUP falls between the paper's Qwen3-Embed-0.6B and Qwen3-Embed-4B (.040 / .122).
+
+**The pool** (`build_congress_dense_pool`):
+- the two runs merged in turn (rank 1 of each run, then rank 2, and so on) until there are 299 different non-gold passages;
+- then the gold, and a fixed random order (seed crc32("congress300/qid"));
+- passages cut at 1,024 Qwen tokens.
+
+The first stage found the gold for 32 of 254 queries (12.6%). The other 222 golds are injected.
+
+**Differences from the paper's pool:**
+- The paper merged Gemini-Embedding-2 and both Qwen3-Embedding models (footnote 3 also names BM25). We merged Qwen3-Embed-0.6B and SPARSEUP. Gemini-Embedding-2 is an API model, and SPARSEUP took the place of the 4B run. So the distractors are different, and stronger retrievers probably give harder distractors.
+- The paper's tournament reads small shuffled batches side by side. Our score reads one passage at a time.
+
+**Results** (`results/obliq_congress300_query_likelihood.csv`, 254 queries, 300 candidates each):
+
+| System | Pool | NDCG@10 | NDCG@50 | R@1 | R@10 | R@50 | R@100 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Random order (expected) | ours | 0.015 | 0.043 | 0.003 | 0.033 | 0.167 | 0.333 |
+| Oracle GPT-5.2 Tournament (paper, Table 4) | paper's | .913 | .919 | | .957 | .988 | 1.00 |
+| Query likelihood, Qwen3.8-Flash-Next | ours | 0.907 | 0.913 | 0.866 | 0.945 | 0.972 | 0.984 |
+
+- NDCG@10 95% bootstrap interval: [0.874, 0.937]. The paper gives no interval.
+- Gold rank: median 1, 90th percentile 3, worst 258. 14 queries have the gold below rank 10.
+- Fixed random halves: 0.876 [0.826, 0.924] and 0.937 [0.895, 0.973]. One half alone would have given a different answer.
+- Gold found by the first stage (32 queries): NDCG@10 1.000, every gold at rank 1. Injected gold (222 queries): 0.893, R@1 0.847.
+- Time: 3,570 s for the 254 queries (76,200 passage scores) on one GPU, about 14 s per query.
+
+**What this shows, and its limits.**
+- On this pool, one forward pass per passage comes within 0.006 NDCG@10 of the GPT-5.2 tournament. The paper's 0.913 is inside our interval.
+- The pools are different, so this is not a matched comparison. The bias goes in two directions:
+  - stronger first-stage retrievers give harder distractors, which would lower our score;
+  - stronger retrievers also find more golds, and found golds were all at rank 1 here, which would raise it.
+- The queries were made by sampling p(recollection | passage) from an LLM, and query likelihood estimates the same quantity (see part 1). This is the largest open caveat.
+- A matched test needs the GPT-5.2 tournament on our pool, or our scorer on the paper's pool. The paper does not release its pools.
+- Compared with part 1 (0.959 over 50 same-hearing candidates), the score drops by 0.052 with 6 times more candidates, chosen by retrievers to look like the query.
+
 ## Corrections to the earlier plan
 
 - The tech report's residual-path analysis is about the gated-residual streams of a 20-layer probe model. It does not show that the softmax-attention layers are the main long-range readers.
@@ -317,5 +372,9 @@ So the signals match the query to its exchange. They do not pick dramatic passag
    - Copy `phase2b_bm25.py` and `phase2b_baselines.py` to `PHASE2B["cand_dir"]` and press **Build BM25 candidates and baseline runs**. This needs pyserini and Java 21, takes about 5 minutes, and runs in its own process.
    - Choose a tier and press **Run Phase 2b teacher job**. On the current fast path the smoke tier took 157 s (measured, 97 queries). For the dev tier I estimate about 17 minutes, based on 2.95 s per 25K-token query (not measured end to end). Records that already exist are skipped.
    - Press **Refresh Phase 2b results**.
+6. OBLIQ-Bench Congress, paper-style pool:
+   - Download `dianetc/OBLIQ-Bench` (`tip-of-tongue/congress`).
+   - Run `obliq_embed.py --models Qwen/Qwen3-Embedding-0.6B` and `obliq_sparse.py` in their own processes. Release the kernel's CUDA cache first, and lower `--batch_tokens` when the model is loaded next to them.
+   - Call `build_congress_dense_pool(tokenizer, [run paths])`, then `start_upr_job` on `congress300`.
 
 Requirements: `transformers==5.18.0` (it has `qwen4_exp`), `torch>=2.11` with CUDA (Triton 3.6), `flash-linear-attention==0.5.2`, `safetensors`, `datasets`, `polars`, and `pytrec-eval-terrier`. For the Phase 2b first stage: `pyserini==2.4.0` with a Java 21 JRE (`JAVA_HOME`) in the environment that runs `phase2b_bm25.py`. See the pyserini note under "Lessons" before you install it next to the notebook.
