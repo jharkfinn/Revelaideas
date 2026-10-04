@@ -344,6 +344,7 @@ The first stage found the gold for 32 of 254 queries (12.6%). The other 222 gold
 - Gold rank: median 1, 90th percentile 3, worst 258. 14 queries have the gold below rank 10.
 - Fixed random halves: 0.876 [0.826, 0.924] and 0.937 [0.895, 0.973]. One half alone would have given a different answer.
 - Gold found by the first stage (32 queries): NDCG@10 1.000, every gold at rank 1. Injected gold (222 queries): 0.893, R@1 0.847.
+- Without gold injection (the same pipeline end to end): the 32 found golds stay at rank 1 and the 222 others are lost, so NDCG@10 = R@10 = R@100 = 32 / 254 = 0.126. Paper, Table 4: LateOn 0.083, GPT-5.2 Query Rewriter 0.084, GPT-5.2 Multi-Hop Agent 0.183. The first stage is the limit.
 - Time: 3,570 s for the 254 queries (76,200 passage scores) on one GPU, about 14 s per query.
 
 **What this shows, and its limits.**
