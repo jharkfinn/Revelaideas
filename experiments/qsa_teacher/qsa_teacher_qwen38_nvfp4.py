@@ -760,6 +760,614 @@ def _(DEVICE, model, wiki_ids):
     return
 
 
+@app.cell
+def _():
+    mo.md(r"""
+    ## Phase 2 pilot: does the indexer point at the gold passage?
+
+    Natural Questions dev (Tevatron/wikipedia-nq): 1 gold passage + 15 BM25 hard negatives per question,
+    each passage padded or cut to exactly 160 tokens (40 indexer blocks). The gold position cycles over
+    the 16 slots. The prompt uses the chat template in non-thinking mode; the gold answer is teacher-forced.
+
+    Query rows: the question tokens ($G_q$) and the rows that predict each answer token ($G_a$).
+    For layer $\ell$ and chunk $j$ (token span $P_j$):
+
+    $$\pi^{\ell}_t(b) = \mathrm{softmax}_{b \in V_t}\big(s^{\ell}_{t,b}\big), \qquad m^{\ell}_j = \frac{1}{|G|}\sum_{t \in G}\ \sum_{b \in P_j} \pi^{\ell}_t(b), \qquad c^{\ell}_j = m^{\ell}_j - m^{\ell,\mathrm{null}}_j$$
+
+    - $V_t$ = complete blocks visible to row $t$; $G$ = a row group; $m^{\ell,\mathrm{null}}_j$ = the same mass with the question replaced by "N/A".
+    - Dense-head teachers use the attention probability mass of each of the 12 x 24 = 288 heads on $P_j$, with all causal keys (dense) or with the indexer's own selection (sparse).
+    """)
+    return
+
+
+@app.function
+def build_rag_example(tokenizer, question, passages, answer, chunk_len=160, r=4, max_answer=32):
+    """Chat-format RAG prompt with every passage exactly `chunk_len` tokens and block-aligned.
+
+    Returns ids [1, T], chunk token spans, question rows, and the rows that predict each answer token.
+    """
+    def enc(s):
+        return tokenizer(s, add_special_tokens=False).input_ids
+    nl = enc("\n")[0]
+    pre = enc("<|im_start|>user\nRead the passages, then answer the question in a few words.\n\n")
+    pre = pre + [nl] * (-len(pre) % r)
+    spans, body = [], []
+    for i, p in enumerate(passages):
+        c = enc(f"[{i + 1}] {p['title']}\n{p['text']}")[: chunk_len - 1]
+        c = c + [nl] * (chunk_len - len(c))
+        start = len(pre) + i * chunk_len
+        spans.append((start, start + chunk_len))
+        body += c
+    q = enc(f"Question: {question}")
+    mid = enc("<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    a = enc(answer)[:max_answer]
+    ids = pre + body + q + mid + a
+    q0 = len(pre) + len(body)
+    a0 = q0 + len(q) + len(mid)
+    return dict(
+        ids=torch.tensor([ids]),
+        spans=spans,
+        q_rows=torch.arange(q0, q0 + len(q)),
+        a_rows=torch.arange(a0 - 1, a0 - 1 + len(a)),
+    )
+
+
+@app.function
+def attention_side_path(attn, x, cos, sin, rows, sel_tokens=None):
+    """Recompute one QSA attention layer for query rows from its input.
+
+    attn: Qwen4ExpTextAttention; x: [T, D] layer input (one unpadded sequence); cos/sin: [T, rot];
+    rows: LongTensor [R] absolute positions; sel_tokens: optional bool [R, T] indexer selection
+    (None = dense causal attention).
+    Returns probs [R, Hh, T] fp32, head outputs o [R, Hh, dh] (before the gate), gate sigma(g)
+    [R, Hh, dh], and the module output y [R, D] (gated heads through o_proj).
+    """
+    T = x.shape[0]
+    dh = attn.head_dim
+    qg = attn.q_proj(x[rows]).view(rows.numel(), -1, dh * 2)
+    query, gate = torch.chunk(qg, 2, dim=-1)
+    q = attn.q_norm(query)
+    k = attn.k_norm(attn.k_proj(x).view(T, -1, dh))
+    v = attn.v_proj(x).view(T, -1, dh)
+    q = qm.apply_rotary_pos_emb(q, cos=cos[rows], sin=sin[rows], unsqueeze_dim=1)
+    k = qm.apply_rotary_pos_emb(k, cos=cos, sin=sin, unsqueeze_dim=1)
+    rep = q.shape[1] // k.shape[1]
+    k = k.repeat_interleave(rep, dim=1)
+    v = v.repeat_interleave(rep, dim=1)
+    logits = torch.einsum("rhd,thd->rht", q.float(), k.float()) * attn.scaling
+    allowed = torch.arange(T, device=x.device)[None, :] <= rows[:, None]
+    if sel_tokens is not None:
+        allowed = allowed & sel_tokens
+    logits = logits.masked_fill(~allowed[:, None, :], float("-inf"))
+    probs = logits.softmax(-1)
+    o = torch.einsum("rht,thd->rhd", probs.to(v.dtype), v)
+    g = torch.sigmoid(gate.float())
+    y = attn.o_proj((o.float() * g).to(x.dtype).reshape(rows.numel(), -1))
+    return dict(probs=probs, o=o, gate=g, y=y)
+
+
+@app.function
+def indexer_selection_tokens(indexer, x, cos, sin, rows):
+    """Token-level selection mask [R, T] of the indexer (top blocks + 0..3 tail tokens) and scores."""
+    T = x.shape[0]
+    r = indexer.compress_ratio
+    q, kbar = qsa_index_parts(indexer, x, cos, sin)
+    sc = qsa_block_scores(q[rows], kbar, rows, r, rope_dim=cos.shape[-1])
+    sel_b = qsa_select_blocks(sc["score"], indexer.block_topk)
+    nb = kbar.shape[0]
+    tok = torch.zeros(rows.numel(), T, dtype=torch.bool, device=x.device)
+    tok[:, : nb * r] = sel_b.repeat_interleave(r, dim=-1)
+    cols = torch.arange(T, device=x.device)
+    tail0 = ((rows + 1) // r) * r
+    tok |= (cols[None, :] >= tail0[:, None]) & (cols[None, :] <= rows[:, None])
+    return tok, sc, sel_b
+
+
+@app.function
+def chunk_mass(token_weights, spans):
+    """token_weights [..., T]; spans list of (start, end) token ranges -> [..., K] summed weight."""
+    return torch.stack([token_weights[..., s:e].sum(-1) for s, e in spans], dim=-1)
+
+
+@app.function
+@torch.no_grad()
+def extract_teacher_signals(model, ex):
+    """One forward pass of a build_rag_example output; chunk-level teacher signals per QSA layer.
+
+    Row groups G: 0 = question rows, 1 = answer rows, 2 = both. Returns CPU float tensors:
+      idx   [L, G, 8, K]: indexer softmax mass over blocks for (full score, RoPE part, position-free
+                          part) at the code scale s = I / sqrt(d) and at the paper scale I (the
+                          distribution the indexer was trained on), then the mean and the max block
+                          score in the chunk. Order: mass, mass_rope, mass_nope, mass_paper,
+                          mass_rope_paper, mass_nope_paper, mean_score, max_score
+      sel   [L, G, K]:    share of the chunk's blocks inside the top-512 selection
+      dense [L, H, G, K]: dense attention mass per head; sparse: same under the indexer selection
+      gate  [L, H, G]:    mean sigmoid output gate; gnorm: norm of the gated head output (sparse)
+    """
+    device = model.lm_head.weight.device
+    store, hooks = capture_attention_inputs(model)
+    try:
+        model.model(ex["ids"].to(device))
+    finally:
+        for h in hooks:
+            h.remove()
+    spans = ex["spans"]
+    nq, na = ex["q_rows"].numel(), ex["a_rows"].numel()
+    rows = torch.cat([ex["q_rows"], ex["a_rows"]]).to(device)
+    groups = [slice(0, nq), slice(nq, nq + na), slice(0, nq + na)]
+    out = {k: [] for k in ("idx", "sel", "dense", "sparse", "gate", "gnorm")}
+    for li in sorted(store):
+        x, (cos, sin) = store[li]
+        x, cos, sin = x[0], cos[0], sin[0]
+        attn = model.model.layers[li].self_attn
+        r, d = attn.indexer.compress_ratio, attn.indexer.index_head_dim
+        tok, sc, selb = indexer_selection_tokens(attn.indexer, x, cos, sin, rows)
+        valid = sc["valid"]
+        neg = float("-inf")
+        s_rope = (torch.relu(sc["dots_rope"]).sum(-1) / math.sqrt(d)).masked_fill(~valid, neg)
+        s_nope = (torch.relu(sc["dots_nope"]).sum(-1) / math.sqrt(d)).masked_fill(~valid, neg)
+        full = sc["score"]
+        masses = [torch.stack([(v * scale).softmax(-1)[:, s // r : e // r].sum(-1) for s, e in spans], -1)
+                  for scale in (1.0, math.sqrt(d)) for v in (full, s_rope, s_nope)]
+        finite = full.masked_fill(~valid, 0.0)
+        mean_sc = torch.stack([finite[:, s // r : e // r].mean(-1) for s, e in spans], -1)
+        max_sc = torch.stack([full[:, s // r : e // r].amax(-1) for s, e in spans], -1)
+        idx = torch.stack(masses + [mean_sc, max_sc], 1)
+        sel = torch.stack([selb[:, s // r : e // r].float().mean(-1) for s, e in spans], -1)
+        sp = attention_side_path(attn, x, cos, sin, rows, tok)
+        de = attention_side_path(attn, x, cos, sin, rows, None)
+        dense, sparse = chunk_mass(de["probs"], spans), chunk_mass(sp["probs"], spans)
+        gate = sp["gate"].mean(-1)
+        gnorm = (sp["o"].float() * sp["gate"]).norm(dim=-1)
+        out["idx"].append(torch.stack([idx[g].mean(0) for g in groups]))
+        out["sel"].append(torch.stack([sel[g].mean(0) for g in groups]))
+        out["dense"].append(torch.stack([dense[g].mean(0) for g in groups], 1))
+        out["sparse"].append(torch.stack([sparse[g].mean(0) for g in groups], 1))
+        out["gate"].append(torch.stack([gate[g].mean(0) for g in groups], 1))
+        out["gnorm"].append(torch.stack([gnorm[g].mean(0) for g in groups], 1))
+    del store
+    return {k: torch.stack(v).float().cpu() for k, v in out.items()}
+
+
+@app.cell
+def _(DEVICE, model, wiki_ids):
+    mo.stop("model" not in globals(), mo.md("Load the model first."))
+    _ids = wiki_ids[:, :3000].to(DEVICE)
+    _ins, _outs, _hooks = {}, {}, []
+    for _li, _layer in enumerate(model.model.layers):
+        if _layer.layer_type != "linear_attention":
+            _hooks.append(_layer.self_attn.register_forward_pre_hook(
+                lambda m, a, k, li=_li: _ins.__setitem__(li, (a[0].detach(), a[1])), with_kwargs=True))
+            _hooks.append(_layer.self_attn.register_forward_hook(
+                lambda m, a, o, li=_li: _outs.__setitem__(li, o[0].detach())))
+    with torch.no_grad():
+        model.model(_ids)
+    for _h in _hooks:
+        _h.remove()
+    _rows = torch.tensor([5, 1000, 2050, 2051, 2052, 2600, 2999], device=DEVICE)
+    _res = []
+    with torch.no_grad():
+        for _li in sorted(_ins):
+            _x, (_cos, _sin) = _ins[_li]
+            _attn = model.model.layers[_li].self_attn
+            _tok, _, _ = indexer_selection_tokens(_attn.indexer, _x[0], _cos[0], _sin[0], _rows)
+            _sp = attention_side_path(_attn, _x[0], _cos[0], _sin[0], _rows, _tok)
+            _de = attention_side_path(_attn, _x[0], _cos[0], _sin[0], _rows, None)
+            _ref = _outs[_li][0, _rows].float()
+            _res.append(dict(layer=_li, sparse_vs_module=(_sp["y"].float() - _ref).abs().max().item(),
+                             dense_vs_module=(_de["y"].float() - _ref).abs().max().item(),
+                             module_absmax=_ref.abs().max().item()))
+    del _ins, _outs
+    side_path_check = pl.DataFrame(_res)
+    side_path_check
+    return
+
+
+@app.function
+def nq_pilot_examples(n, k):
+    """First n NQ-dev questions with >= k-1 BM25 negatives; gold slot cycles over 0..k-1."""
+    from datasets import load_dataset
+    ds = load_dataset(
+        "parquet",
+        data_files={"dev": "hf://datasets/Tevatron/wikipedia-nq@refs%2Fconvert%2Fparquet/default/dev/*.parquet"},
+        split="dev",
+    )
+    out = []
+    for row in ds:
+        if not row["positive_passages"] or not row["answers"] or len(row["negative_passages"]) < k - 1:
+            continue
+        gold = len(out) % k
+        negs = row["negative_passages"][: k - 1]
+        out.append(dict(question=row["query"], answer=row["answers"][0], gold=gold,
+                        passages=negs[:gold] + [row["positive_passages"][0]] + negs[gold:]))
+        if len(out) == n:
+            break
+    return out
+
+
+@app.cell
+def _():
+    pilot_sets = {"k16": nq_pilot_examples(96, 16), "k64": nq_pilot_examples(64, 64)}
+    pilot_button = mo.ui.run_button(
+        label=f"Run pilot (K=16: {len(pilot_sets['k16'])} questions, K=64: {len(pilot_sets['k64'])} questions; x 2 passes)")
+    pilot_button
+    return pilot_button, pilot_sets
+
+
+@app.function
+def start_pilot_job(model, tokenizer, pilot_sets, out_dir="/root/models"):
+    """Run the pilot in a daemon thread so that a cancelled HTTP request (which interrupts the kernel's
+    main thread) cannot stop it. Results go to `<out_dir>/pilot_nq_<regime>.pt` after every question;
+    the returned dict shows progress, status and any error."""
+    import threading
+    import traceback
+    state = {"status": "running", "progress": "", "error": None, "t0": time.time()}
+    for regime in pilot_sets:
+        path = os.path.join(out_dir, f"pilot_nq_{regime}.pt")
+        if os.path.exists(path):
+            os.remove(path)
+
+    def work():
+        try:
+            for regime, examples in pilot_sets.items():
+                recs = []
+                for i, ex in enumerate(examples):
+                    rec = dict(gold=ex["gold"])
+                    for name, q in (("q", ex["question"]), ("null", "N/A")):
+                        rec[name] = extract_teacher_signals(
+                            model, build_rag_example(tokenizer, q, ex["passages"], ex["answer"]))
+                    recs.append(rec)
+                    torch.save(recs, os.path.join(out_dir, f"pilot_nq_{regime}.pt"))
+                    state["progress"] = f"{regime} {i + 1}/{len(examples)} ({time.time() - state['t0']:.0f}s)"
+            state["status"] = "finished"
+        except Exception:
+            state["status"] = "error"
+            state["error"] = traceback.format_exc()
+
+    state["thread"] = threading.Thread(target=work, name="qsa-pilot", daemon=True)
+    state["thread"].start()
+    return state
+
+
+@app.cell
+def _(model, pilot_button, pilot_sets, tokenizer):
+    mo.stop(not pilot_button.value, mo.md("Press **Run pilot**. It runs in a background thread; results are saved to `/root/models/pilot_nq_<regime>.pt` after every question."))
+    use_fast_indexer(True)
+    pilot_job = start_pilot_job(model, tokenizer, pilot_sets)
+    mo.md("Pilot started in a background thread. Run the next cell to load whatever has finished.")
+    return (pilot_job,)
+
+
+@app.cell
+def _(pilot_job, pilot_sets):
+    pilot_job["progress"]
+    pilot_runs = {_k: torch.load(f"/root/models/pilot_nq_{_k}.pt") for _k in pilot_sets if os.path.exists(f"/root/models/pilot_nq_{_k}.pt")}
+    pilot_records = pilot_runs.get("k16")
+    mo.md(f"Pilot job: **{pilot_job['status']}**, {pilot_job['progress']}. Loaded: " + ", ".join(f"{_k} = {len(_v)} questions" for _k, _v in pilot_runs.items()))
+    return (pilot_runs,)
+
+
+@app.function
+def rank_metrics(scores, gold):
+    """scores [N, K]; gold [N] -> MRR, R@1, nDCG@10 (one relevant chunk; ties count against the gold)."""
+    g = scores[torch.arange(scores.shape[0]), gold]
+    rank = (scores > g[:, None]).sum(-1) + (scores == g[:, None]).sum(-1)
+    rr = 1.0 / rank.float()
+    ndcg = torch.where(rank <= 10, 1.0 / torch.log2(rank.float() + 1.0), torch.zeros_like(rr))
+    return dict(mrr=rr.mean().item(), r_at_1=(rank == 1).float().mean().item(), ndcg_at_10=ndcg.mean().item())
+
+
+@app.function
+def pilot_score_table(records, n_top_heads=16):
+    """Gold-rank metrics for every teacher variant in the pilot records.
+
+    Scorers: per-layer indexer (row group x variant x raw/null-calibrated), layer-mean of per-example
+    z-scored indexer masses, native top-512 selection share, single dense/sparse heads, and the sum of
+    the top `n_top_heads` heads chosen on the other half of the questions (2-fold).
+    """
+    gold = torch.tensor([r["gold"] for r in records])
+    N = len(records)
+    stack = lambda part, key: torch.stack([r[part][key] for r in records])
+    idx_q, idx_n = stack("q", "idx"), stack("null", "idx")
+    sel_q = stack("q", "sel")
+    dense_q, dense_n = stack("q", "dense"), stack("null", "dense")
+    sparse_q, sparse_n = stack("q", "sparse"), stack("null", "sparse")
+    gate_q = stack("q", "gate")
+    groups = ["question", "answer", "both"]
+    variants = ["mass", "mass_rope", "mass_nope", "mass_paper", "mass_rope_paper", "mass_nope_paper", "mean_score", "max_score"]
+    rows = []
+
+    def add(family, layer, head, group, variant, calib, scores):
+        rows.append(dict(family=family, layer=layer, head=head, rows=group, variant=variant,
+                         calibrated=calib, **rank_metrics(scores, gold)))
+
+    L = idx_q.shape[1]
+    for li in range(L):
+        for gi, g in enumerate(groups):
+            for vi, v in enumerate(variants):
+                add("indexer", li, -1, g, v, False, idx_q[:, li, gi, vi])
+                add("indexer", li, -1, g, v, True, idx_q[:, li, gi, vi] - idx_n[:, li, gi, vi])
+            add("native_selection", li, -1, g, "top512_share", False, sel_q[:, li, gi])
+
+    def z(x):
+        return (x - x.mean(-1, keepdim=True)) / x.std(-1, keepdim=True).clamp_min(1e-12)
+
+    for gi, g in enumerate(groups):
+        for calib in (False, True):
+            for vi in (0, 3):
+                m = idx_q[:, :, gi, vi] - (idx_n[:, :, gi, vi] if calib else 0)
+                add("indexer_layer_mean", -1, -1, g, variants[vi], calib, z(m).mean(1))
+
+    H = dense_q.shape[2]
+    for fam, tq, tn in (("dense_head", dense_q, dense_n), ("sparse_head", sparse_q, sparse_n)):
+        for gi, g in enumerate(groups):
+            for calib in (False, True):
+                s = tq[:, :, :, gi] - (tn[:, :, :, gi] if calib else 0)
+                for li in range(L):
+                    for h in range(H):
+                        add(fam, li, h, g, "mass", calib, s[:, li, h])
+                # cross-validated top heads (QRHead-style selection on the other half)
+                half = torch.arange(N) < N // 2
+                folds = [(half, ~half), (~half, half)]
+                agg_rr = []
+                gated_rr = []
+                for tr, te in folds:
+                    flat = s[tr].reshape(int(tr.sum()), L * H, -1)
+                    mrr_tr = torch.tensor([rank_metrics(flat[:, j], gold[tr])["mrr"] for j in range(L * H)])
+                    top = mrr_tr.topk(n_top_heads).indices
+                    flat_te = s[te].reshape(int(te.sum()), L * H, -1)
+                    agg_rr.append((flat_te[:, top].sum(1), gold[te]))
+                    gw = gate_q[te][:, :, :, gi].reshape(int(te.sum()), L * H, 1)
+                    gated_rr.append(((flat_te[:, top] * gw[:, top]).sum(1), gold[te]))
+                for name, parts in ((f"top{n_top_heads}_cv", agg_rr), (f"top{n_top_heads}_cv_gated", gated_rr)):
+                    sc = torch.cat([p[0] for p in parts])
+                    gd = torch.cat([p[1] for p in parts])
+                    rows.append(dict(family=fam + "_" + name, layer=-1, head=-1, rows=g, variant="mass",
+                                     calibrated=calib, **rank_metrics(sc, gd)))
+                add(fam + "_all_mean", -1, -1, g, "mass", calib, s.mean((1, 2)))
+    K = idx_q.shape[-1]
+    rand = sum(1.0 / k for k in range(1, K + 1)) / K
+    rows.append(dict(family="random", layer=-1, head=-1, rows="-", variant="-", calibrated=False,
+                     mrr=rand, r_at_1=1.0 / K, ndcg_at_10=sum(1 / math.log2(k + 1) for k in range(1, 11)) / K))
+    return pl.DataFrame(rows)
+
+
+@app.function
+def position_profile(records, part="q", key="idx", group=0, variant=0):
+    """Mean teacher mass of NON-gold chunks by slot, per layer -> long DataFrame (layer, slot, mass)."""
+    out = []
+    for li in range(records[0][part][key].shape[0]):
+        acc = torch.zeros(records[0][part][key].shape[-1])
+        cnt = torch.zeros_like(acc)
+        for r in records:
+            m = r[part][key][li, group, variant]
+            mask = torch.ones_like(m, dtype=torch.bool)
+            mask[r["gold"]] = False
+            acc += torch.where(mask, m, torch.zeros_like(m))
+            cnt += mask.float()
+        for s, v in enumerate((acc / cnt).tolist()):
+            out.append(dict(layer=li, slot=s, mass=v))
+    return pl.DataFrame(out)
+
+
+@app.cell
+def _(pilot_runs):
+    mo.stop(not pilot_runs, mo.md("No pilot results yet."))
+    regime_picker = mo.ui.dropdown(options=list(pilot_runs), value=("k64" if "k64" in pilot_runs else list(pilot_runs)[0]), label="Pilot regime")
+    regime_picker
+    return (regime_picker,)
+
+
+@app.cell
+def _(model, pilot_runs, regime_picker):
+    QSA_LAYERS = [li for li, l in enumerate(model.model.layers) if l.layer_type != "linear_attention"]
+    pilot_eval = pilot_runs[regime_picker.value]
+    pilot_scores = pilot_score_table(pilot_eval).with_columns(
+        pl.when(pl.col("layer") >= 0).then(pl.col("layer").map_elements(lambda i: QSA_LAYERS[i], return_dtype=pl.Int64))
+        .otherwise(-1).alias("model_layer"))
+    _best = lambda fam: (pilot_scores.filter(pl.col("family") == fam).sort("mrr", descending=True).head(1))
+    pilot_summary = pl.concat([
+        pilot_scores.filter(pl.col("family") == "random"),
+        _best("indexer"),
+        pilot_scores.filter((pl.col("family") == "indexer_layer_mean")).sort("mrr", descending=True),
+        _best("native_selection"),
+        _best("dense_head"), _best("sparse_head"),
+        pilot_scores.filter(pl.col("family").str.contains("_cv|_all_mean")).sort("mrr", descending=True),
+    ])
+    mo.vstack([mo.md(f"**Pilot {regime_picker.value}:** {len(pilot_eval)} NQ-dev questions, K = {pilot_eval[0]['q']['idx'].shape[-1]} chunks, gold slot balanced. Ties count against the gold. Top-head sets are chosen on one half of the questions and scored on the other half (2-fold)."),
+               mo.ui.table(pilot_summary.drop("head"), selection=None)])
+    return QSA_LAYERS, pilot_eval, pilot_scores
+
+
+@app.cell
+def _(pilot_scores):
+    _d = (pilot_scores.filter((pl.col("family") == "indexer") & (pl.col("variant") == "mass") & (pl.col("rows") != "both"))
+          .with_columns((pl.col("rows") + pl.when(pl.col("calibrated")).then(pl.lit(", null-calibrated")).otherwise(pl.lit(", raw"))).alias("teacher")))
+    _ref = pl.concat([
+        pilot_scores.filter(pl.col("family") == "random").select(pl.lit("random order").alias("baseline"), "mrr"),
+        pilot_scores.filter(pl.col("family") == "dense_head_top16_cv").sort("mrr", descending=True).head(1)
+            .select(pl.lit("top-16 dense heads (CV)").alias("baseline"), "mrr"),
+    ])
+    _colors = alt.Scale(domain=["question, raw", "question, null-calibrated", "answer, raw", "answer, null-calibrated"],
+                        range=["#2a78d6", "#eb6834", "#1baf7a", "#eda100"])
+    _lines = alt.Chart(_d).mark_line(strokeWidth=2, point=alt.OverlayMarkDef(size=64, filled=True)).encode(
+        x=alt.X("model_layer:O", title="QSA layer"),
+        y=alt.Y("mrr:Q", title="MRR of the gold chunk", scale=alt.Scale(domain=[0, 1])),
+        color=alt.Color("teacher:N", scale=_colors, title="Indexer rows"),
+        tooltip=["model_layer", "teacher", alt.Tooltip("mrr:Q", format=".3f"), alt.Tooltip("r_at_1:Q", format=".3f"), alt.Tooltip("ndcg_at_10:Q", format=".3f")],
+    )
+    _rules = alt.Chart(_ref).mark_rule(strokeDash=[4, 4], color="#8a8985").encode(y="mrr:Q", tooltip=["baseline", alt.Tooltip("mrr:Q", format=".3f")])
+    _labels = alt.Chart(_ref).mark_text(align="left", dx=4, dy=-6, color="#52514e").encode(y="mrr:Q", x=alt.value(0), text="baseline")
+    _end = alt.Chart(_d.filter(pl.col("model_layer") == pl.col("model_layer").max())).mark_text(
+        align="left", dx=8, color="#52514e").encode(x="model_layer:O", y="mrr:Q", text="teacher")
+    indexer_layer_chart = (_rules + _labels + _lines + _end).properties(
+        width=560, height=300, title="Indexer chunk mass as a ranker, by layer (table above has every value)")
+    indexer_layer_chart
+    return
+
+
+@app.cell
+def _(pilot_scores):
+    _h = pilot_scores.filter((pl.col("family") == "dense_head") & (pl.col("rows") == "both") & (~pl.col("calibrated")))
+    head_heatmap = alt.Chart(_h).mark_rect(stroke="#fcfcfb", strokeWidth=1).encode(
+        x=alt.X("head:O", title="Head"), y=alt.Y("model_layer:O", title="QSA layer"),
+        color=alt.Color("mrr:Q", scale=alt.Scale(range=["#cde2fb", "#104281"]), title="MRR"),
+        tooltip=["model_layer", "head", alt.Tooltip("mrr:Q", format=".3f"), alt.Tooltip("r_at_1:Q", format=".3f")],
+    ).properties(width=560, height=260, title="Single dense head as a ranker (question + answer rows, raw mass)")
+    head_heatmap
+    return
+
+
+@app.cell
+def _(QSA_LAYERS, pilot_eval):
+    _K = pilot_eval[0]['q']['idx'].shape[-1]
+    _p = position_profile(pilot_eval).with_columns(
+        pl.col("layer").map_elements(lambda i: QSA_LAYERS[i], return_dtype=pl.Int64).alias("model_layer"),
+        (pl.col("mass") * _K).alias("rel_mass"))
+    position_heatmap = alt.Chart(_p).mark_rect(stroke="#fcfcfb", strokeWidth=1).encode(
+        x=alt.X("slot:O", title=f"Chunk slot (0 = first passage, {_K - 1} = next to the question)"),
+        y=alt.Y("model_layer:O", title="QSA layer"),
+        color=alt.Color("rel_mass:Q", scale=alt.Scale(range=["#cde2fb", "#104281"]), title="Mass x K"),
+        tooltip=["model_layer", "slot", alt.Tooltip("rel_mass:Q", format=".2f")],
+    ).properties(width=560, height=260, title="Indexer mass on non-gold chunks by slot (question rows, raw); 1.0 = uniform")
+    position_heatmap
+    return
+
+
+@app.function
+def pilot_cv_report(records, n_boot=4000, seed=0):
+    """Fair comparison of teachers on question rows, with every choice made on the other half of the
+    questions (2-fold): best indexer layer (raw / null-calibrated), layer mean, native top-512 share,
+    and top-16 dense / sparse heads. Adds a paired bootstrap of (indexer CV calibrated - dense top-16)."""
+    gold = torch.tensor([r["gold"] for r in records])
+    N = len(records)
+    S = lambda part, key: torch.stack([r[part][key] for r in records])
+    idx_q, idx_n, sel_q = S("q", "idx"), S("null", "idx"), S("q", "sel")
+    dense_q, sparse_q = S("q", "dense"), S("q", "sparse")
+
+    def ranks(scores):
+        g = scores[torch.arange(N), gold]
+        return (scores > g[:, None]).sum(-1) + (scores == g[:, None]).sum(-1)
+
+    half = torch.arange(N) < N // 2
+    folds = ((half, ~half), (~half, half))
+
+    def cv_pick(cands):
+        out = torch.zeros(N, cands.shape[-1])
+        for tr, te in folds:
+            mrr = torch.stack([(1.0 / ranks(cands[:, j])[tr].float()).mean() for j in range(cands.shape[1])])
+            out[te] = cands[te][:, mrr.argmax()]
+        return out
+
+    def cv_top_heads(t, n=16):
+        flat = t.reshape(N, -1, t.shape[-1])
+        out = torch.zeros(N, t.shape[-1])
+        for tr, te in folds:
+            mrr = torch.stack([(1.0 / ranks(flat[:, j])[tr].float()).mean() for j in range(flat.shape[1])])
+            out[te] = flat[te][:, mrr.topk(n).indices].sum(1)
+        return out
+
+    z = lambda x: (x - x.mean(-1, keepdim=True)) / x.std(-1, keepdim=True).clamp_min(1e-12)
+    calib = idx_q[:, :, 0, 0] - idx_n[:, :, 0, 0]
+    teachers = {
+        "indexer, best layer (CV), null-calibrated": cv_pick(calib),
+        "indexer, best layer (CV), raw": cv_pick(idx_q[:, :, 0, 0]),
+        "indexer, best layer (CV), paper-scale softmax, raw": cv_pick(idx_q[:, :, 0, 3]),
+        "indexer, z-scored layer mean, null-calibrated": z(calib).mean(1),
+        "native top-512 share, best layer (CV)": cv_pick(sel_q[:, :, 0]),
+        "dense heads, top 16 (CV)": cv_top_heads(dense_q[..., 0, :]),
+        "sparse heads, top 16 (CV)": cv_top_heads(sparse_q[..., 0, :]),
+    }
+    rows, rr, nd = [], {}, {}
+    for name, t in teachers.items():
+        rk = ranks(t).float()
+        rr[name] = 1.0 / rk
+        nd[name] = torch.where(rk <= 10, 1.0 / torch.log2(rk + 1.0), torch.zeros_like(rk))
+        rows.append(dict(teacher=name, mrr=rr[name].mean().item(), ndcg_at_10=nd[name].mean().item(),
+                         r_at_1=(rk == 1).float().mean().item()))
+    K = idx_q.shape[-1]
+    rows.append(dict(teacher="random order", mrr=sum(1.0 / k for k in range(1, K + 1)) / K,
+                     ndcg_at_10=sum(1 / math.log2(k + 1) for k in range(1, 11)) / K, r_at_1=1.0 / K))
+    gen = torch.Generator().manual_seed(seed)
+    b = torch.randint(0, N, (n_boot, N), generator=gen)
+    a, c = "indexer, best layer (CV), null-calibrated", "dense heads, top 16 (CV)"
+    boot = {}
+    for metric, d in (("mrr", rr), ("ndcg_at_10", nd)):
+        diff = d[a] - d[c]
+        m = diff[b].mean(1)
+        boot[metric] = (diff.mean().item(), m.quantile(0.025).item(), m.quantile(0.975).item())
+    return pl.DataFrame(rows), boot
+
+
+@app.cell
+def _(pilot_runs):
+    _tbls = []
+    for _regime, _recs in pilot_runs.items():
+        _t, _b = pilot_cv_report(_recs)
+        _tbls.append(mo.vstack([
+            mo.md(f"**{_regime}** ({len(_recs)} questions). Indexer (CV, calibrated) minus dense top-16 (CV): "
+                  f"MRR {_b['mrr'][0]:+.3f} [{_b['mrr'][1]:+.3f}, {_b['mrr'][2]:+.3f}], "
+                  f"nDCG@10 {_b['ndcg_at_10'][0]:+.3f} [{_b['ndcg_at_10'][1]:+.3f}, {_b['ndcg_at_10'][2]:+.3f}] (95% paired bootstrap)"),
+            mo.ui.table(_t.with_columns(pl.col("mrr", "ndcg_at_10", "r_at_1").round(3)), selection=None, page_size=10),
+        ]))
+    mo.vstack([mo.md("### Fair comparison (question rows only; every choice made on the other half)")] + _tbls)
+    return
+
+
+@app.cell
+def _():
+    mo.md(r"""
+    ### Pilot findings (4 Oct 2026)
+
+    - **Question rows are the clean test.** In NQ, the gold passage contains the answer string and the BM25
+      negatives are filtered to exclude it, so teacher-forced answer rows can find the gold by string match
+      (answer-row MRR is about 0.95 at K = 16). The null question keeps the same answer, and null calibration
+      drops the answer-row score, which fits that reading.
+    - **K = 64 (10.4K tokens, about 20% of blocks kept), the regime that matters:** the indexer with the layer chosen by
+      cross-validation and null calibration matches the cross-validated top-16 dense heads of the same model
+      (nDCG@10 +1.7 points, 95% CI -1.7 to +5.2, 64 questions). At K = 16 (about 75% of blocks kept) it trails
+      them (-3.6 points, CI -6.4 to -1.0, 96 questions).
+    - **Depth profile:** the signal is near random at layer 3 and peaks at layers 31 and 35, then falls toward layer 47.
+    - **Null calibration is required:** it adds 0.1 to 0.2 MRR at mid-depth layers for K = 64.
+    - **Position bias goes toward the first passages, not the recent ones:** the raw mass on non-gold chunks falls
+      with the slot index (slope x (K - 1) / gold margin = -0.27 at layer 31, K = 64). Null calibration
+      removes most of it (-0.07).
+    - **The RoPE / position-free split does not give a free de-biased teacher:** the position-free half alone
+      ranks worse than the full score at mid and late layers, and the RoPE half alone is weak.
+    - **Native top-512 selection is a weak ranker** (best-layer MRR 0.42 at K = 64) even though gold blocks
+      are selected at 2.7x the base rate.
+    - **Output-gate weighting changes nothing** at the chunk level (same ranks with and without it).
+    """)
+    return
+
+
+@app.function
+def profile_forward(model, ids):
+    """Wall time per module family for one forward pass (CUDA-synchronized pre/post hooks)."""
+    times, starts, hooks = {}, {}, []
+    fams = {"experts": NVFP4Experts, "gdn": qm.Qwen4ExpTextGatedDeltaNet, "qsa_attention": qm.Qwen4ExpTextAttention,
+            "qsa_indexer": qm.Qwen4ExpTextQSAIndexer, "ple": qm.Qwen4ExpTextPLELayer}
+    for name, mod in model.named_modules():
+        for fam, cls in fams.items():
+            if isinstance(mod, cls):
+                def pre(m, a, fam=fam, name=name):
+                    torch.cuda.synchronize(); starts[name] = time.time()
+                def post(m, a, o, fam=fam, name=name):
+                    torch.cuda.synchronize(); times[fam] = times.get(fam, 0.0) + time.time() - starts[name]
+                hooks += [mod.register_forward_pre_hook(pre), mod.register_forward_hook(post)]
+    torch.cuda.synchronize(); t0 = time.time()
+    try:
+        with torch.no_grad():
+            model.model(ids)
+    finally:
+        for h in hooks:
+            h.remove()
+    torch.cuda.synchronize()
+    total = time.time() - t0
+    times["other"] = total - sum(v for k, v in times.items() if k != "qsa_indexer")
+    return dict(total_s=total, **{k + "_s": v for k, v in times.items()})
+
+
 if __name__ == "__main__":
     app.run()
 
