@@ -251,19 +251,54 @@ Our 0.590 comes from a softmax that is 11× flatter.
   - Summing the two row sets gives 0.617 for the indexer and 0.626 for QRHead-16. The QRHead-16 gain is +0.019 [+0.013, +0.026].
 - **Single indexer heads.** None beats the sum of the 4 heads; the best, head 3, is 0.051 lower. Head 2 looks positional.
 
-## OBLIQ-Bench Congress Hearings (planned; the run was lost)
+## OBLIQ-Bench Congress Hearings: can the teacher verify oblique relevance?
 
-OBLIQ-Bench (arXiv 2605.06235) Congress Hearings: 254 Reddit-style recollections, 213,650 hearing passages and one gold passage per query. The golds are concentrated: 60 of 1,304 hearings hold all of them, and 10 tech hearings hold 55%.
+**The benchmark.** OBLIQ-Bench (arXiv 2605.06235) Congress Hearings has 254 Reddit-style recollections, 213,650 hearing passages and one gold passage per query. An LLM wrote each recollection from its gold passage, with names, dates and verbatim phrasing removed.
 
-`build_congress_pool` builds a verification pool:
+**Our pool.** `build_congress_pool` makes a verification pool:
 - the gold plus 49 negatives, first from the gold's own hearing (44.8 on average, at least 15), then from the other gold hearings;
 - passages cut at 1,024 tokens, which cuts 21 golds.
 
-This removes the topic shortcut and tests whether the teacher can find the exchange inside its hearing. For random order, NDCG@10 is 0.091 and R@10 is 0.20.
+This pool removes the topic shortcut. The golds are concentrated (60 of 1,304 hearings hold all of them, and 10 tech hearings hold 55%), so the test is whether a system can find the exchange inside its hearing.
 
-The planned systems were the indexer and QRHead-16 on both row sets, query likelihood and MiniLM. Query likelihood mirrors how the queries were made: an LLM wrote each query from its gold passage. Read its result with that in mind.
+The pool differs from the paper's, which uses about 300 dense neighbors from many hearings with the gold injected. So the paper's GPT-5.2 tournament score (0.913 NDCG@10) is context only, not a direct comparison.
 
-The molab sandbox ended during this run (HTTP 410), so there are no Congress numbers yet.
+**Results** (`results/obliq_congress_*.csv`, 254 queries):
+
+| System | NDCG@10 | R@1 | R@10 |
+|---|---:|---:|---:|
+| Random order (expected) | 0.091 | 0.020 | 0.200 |
+| MiniLM-L6 cross-encoder | 0.088 | 0.012 | 0.205 |
+| Indexer L31, τ = 1, query rows (pre-registered) | 0.806 | 0.689 | 0.925 |
+| QRHead-16, query rows (heads chosen on NQ) | 0.865 | 0.768 | 0.953 |
+| QRHead-16, query + decision-point rows | 0.880 | 0.791 | 0.957 |
+| *Exploratory, picked on this test set:* all 24 heads of layer 35 | 0.891 | 0.831 | 0.953 |
+| Query likelihood (UPR), one passage in context | **0.959** | **0.921** | 0.988 |
+| QRHead-16 (both row sets) + query likelihood, z-score sum | 0.958 | 0.921 | 0.992 |
+
+Paired bootstrap, NDCG@10 with 95% intervals:
+- query likelihood − MiniLM: +0.870 [+0.841, +0.899];
+- QRHead-16 (both) − query likelihood: −0.079 [−0.112, −0.047];
+- fusion − query likelihood: −0.001 [−0.015, +0.013];
+- indexer L31 (both) − QRHead-16 (both): −0.063 [−0.084, −0.044].
+
+**Controls.** These rule out shortcuts:
+- passage length alone gives 0.177;
+- the null query alone (salience with no query) gives 0.093 to 0.103;
+- scoring a pool with another same-hearing query's QRHead-16 scores gives R@1 0.078 over 1,390 pairs;
+- filler passages from other hearings fill only 2% to 4% of the top 10.
+
+So the signals match the query to its exchange. They do not pick dramatic passages, long passages or the right hearing.
+
+**What this shows, and its limits.**
+- The model verifies oblique relevance in one forward pass, where a supervised MS MARCO cross-encoder is at chance.
+- Query likelihood wins here, and it was the weakest LLM signal on BEIR (0.562). The queries were made by sampling p(recollection | passage) from an LLM, and query likelihood estimates that same quantity. Part of its lead is therefore the construction, not general skill. No human-written recollections exist to check this.
+- The read + use fusion is the best or tied best on both BEIR (0.631) and Congress (0.958). So it is the most robust teacher target so far.
+- Congress reverses two BEIR findings:
+  - decision-point rows are much worse: indexer −0.183 [−0.226, −0.139]. These queries are about 130 tokens long, and their details sit in the query tokens;
+  - a sharper indexer softmax helps: τ = 0.354 gives 0.868, against 0.806 at τ = 1.
+
+  Deeper layers also do better here (35 > 31 > 27).
 
 ## Corrections to the earlier plan
 

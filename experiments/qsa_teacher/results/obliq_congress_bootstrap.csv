@@ -1,0 +1,9 @@
+comparison,delta_ndcg10,ci_lo,ci_hi
+qrhead16_both - minilm,0.7914,0.7547,0.8277
+indexer_L31_both - minilm,0.7284,0.6867,0.7686
+query_likelihood - minilm,0.8704,0.8405,0.8992
+qrhead16_both - query_likelihood,-0.079,-0.1122,-0.0472
+indexer_L31_both - qrhead16_both,-0.063,-0.0839,-0.0438
+indexer_L31_decision - indexer_L31_query,-0.1827,-0.2264,-0.1392
+qrhead16_both+query_likelihood - query_likelihood,-0.0009,-0.0148,0.0132
+qrhead16_both+query_likelihood - qrhead16_both,0.0781,0.0528,0.1049
