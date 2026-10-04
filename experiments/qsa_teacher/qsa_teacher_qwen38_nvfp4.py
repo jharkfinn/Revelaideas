@@ -2779,6 +2779,64 @@ def build_congress_pool(tokenizer, base="/root/models/obliq/tip-of-tongue/congre
 
 
 @app.function(hide_code=True)
+def build_congress_dense_pool(tokenizer, run_paths, base="/root/models/obliq/tip-of-tongue/congress", size=300, max_doc_tokens=1024,
+                              out="/root/models/phase2b/candidates_congress300.pt"):
+    """OBLIQ-Bench Congress pool in the style of the paper's GPT-5.2 oracle (Sec. 5): the union of the top results
+    of the first-stage runs in run_paths ({qid: [(docid, score), ...]}), merged in turn (rank 1 of each run,
+    then rank 2, ...) until size - 1 distinct non-gold passages, plus the gold passage, in a fixed random
+    order (crc32 seed). The paper also used Gemini-Embedding-2, which is not available here.
+    Returns pool statistics, including how often the first stage found the gold inside the pool."""
+    import json, zlib
+    queries = {json.loads(l)["_id"]: json.loads(l)["text"] for l in open(f"{base}/queries+qrels/queries.jsonl")}
+    qrels = {}
+    for line in open(f"{base}/queries+qrels/qrels.tsv"):
+        q, d, s = line.rstrip("\n").split("\t")
+        if q != "query-id":
+            qrels[q] = {d: int(s)}
+    runs = [torch.load(p, weights_only=False) for p in run_paths]
+    cands, found = {}, 0
+    for q in sorted(qrels):
+        gold = next(iter(qrels[q]))
+        pool, seen, r = [], {gold}, 0
+        in_first_stage = False
+        while len(pool) < size - 1:
+            added = False
+            for run in runs:
+                if r < len(run[q]):
+                    d = run[q][r][0]
+                    added = True
+                    if d == gold:
+                        in_first_stage = True
+                    elif d not in seen and len(pool) < size - 1:
+                        pool.append(d)
+                        seen.add(d)
+            if not added:
+                break
+            r += 1
+        found += in_first_stage
+        pool = pool + [gold]
+        g = torch.Generator().manual_seed(zlib.crc32(f"congress300/{q}".encode()))
+        pool = [pool[i] for i in torch.randperm(len(pool), generator=g).tolist()]
+        cands[q] = [(d, 0.0) for d in pool]
+    need = {d for c in cands.values() for d, _ in c}
+    text = {}
+    for line in open(f"{base}/corpus/corpus.jsonl"):
+        rec = json.loads(line)
+        if rec["_id"] in need:
+            text[rec["_id"]] = rec["text"]
+    docs = {}
+    for d in need:
+        ids = tokenizer(" ".join(text[d].split()), add_special_tokens=False).input_ids[:max_doc_tokens]
+        docs[d] = dict(text=text[d], ids=ids, text_trunc=tokenizer.decode(ids))
+    data = dict(name="congress300", index="obliq-congress-dense-union-pool", k=size, max_doc_tokens=max_doc_tokens,
+                queries={q: queries[q] for q in qrels}, qrels=qrels, cands=cands, docs=docs)
+    torch.save(data, out)
+    sizes = sorted(len(c) for c in cands.values())
+    return dict(queries=len(qrels), pool_size_min=sizes[0], pool_size_median=sizes[len(sizes) // 2], unique_docs=len(docs),
+                gold_found_by_first_stage=round(found / len(qrels), 3))
+
+
+@app.function(hide_code=True)
 def rerank_doc_order(dataset, qid, n):
     """Fixed random permutation of the n BM25 candidates for one query (seed = crc32 of 'dataset/qid')."""
     import zlib

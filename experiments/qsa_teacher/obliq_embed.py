@@ -59,6 +59,7 @@ def main():
     ap.add_argument("--models", nargs="+", default=["Qwen/Qwen3-Embedding-0.6B", "Qwen/Qwen3-Embedding-4B"])
     ap.add_argument("--max_len", type=int, default=512)
     ap.add_argument("--topk", type=int, default=1000)
+    ap.add_argument("--batch_tokens", type=int, default=65536, help="padded tokens per encoder batch (lower it when GPU memory is shared)")
     args = ap.parse_args()
     from transformers import AutoModel, AutoTokenizer
     queries = [json.loads(l) for l in open(f"{args.base}/queries+qrels/queries.jsonl")]
@@ -76,15 +77,15 @@ def main():
         short = name.split("/")[-1]
         t0 = time.time()
         tok = AutoTokenizer.from_pretrained(name, padding_side="left")
-        model = AutoModel.from_pretrained(name, torch_dtype=torch.bfloat16, attn_implementation="sdpa").cuda().eval()
+        model = AutoModel.from_pretrained(name, dtype=torch.bfloat16, attn_implementation="sdpa").cuda().eval()
         emb_path = os.path.join(args.out, f"emb_{short}.pt")
         if os.path.exists(emb_path):
             D = torch.load(emb_path)
         else:
-            D = encode(model, tok, texts, args.max_len)
+            D = encode(model, tok, texts, args.max_len, batch_tokens=args.batch_tokens)
             torch.save(D, emb_path)
         t_doc = time.time() - t0
-        Q = encode(model, tok, [f"Instruct: {INSTRUCT}\nQuery:{q['text']}" for q in queries], args.max_len)
+        Q = encode(model, tok, [f"Instruct: {INSTRUCT}\nQuery:{q['text']}" for q in queries], args.max_len, batch_tokens=args.batch_tokens)
         Dg = D.cuda()
         run = {}
         for b in range(0, len(queries), 64):
